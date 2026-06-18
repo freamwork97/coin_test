@@ -1,0 +1,30 @@
+{
+  "upbit": {
+    "base_url": "https://api.upbit.com/v1"
+  },
+  "paper_trading": {
+    "enabled": true,
+    "initial_balance_krw": 10000000,
+    "fee_rate": 0.0005,
+    "slippage": 0.0003,
+    "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"],
+    "cycle_seconds": 60,
+    "position_size_pct": 0.10
+  },
+  "safety": {
+    "live_trading_enabled": false,
+    "max_daily_loss_rate": -0.05,
+    "max_mdd_rate": -0.10,
+    "max_single_coin_weight": 0.30,
+    "consecutive_loss_stop": 5,
+    "emergency_stop": false
+  },
+  "strategy": {
+    "name": "ma_crossover",
+    "params": {
+      "short_window": 10,
+      "long_window": 30,
+      "interval": "60"
+    }
+  }
+}

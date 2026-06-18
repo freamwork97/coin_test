@@ -1,0 +1,64 @@
+{
+  "upbit": {
+    "base_url": "https://api.upbit.com/v1"
+  },
+  "live_trading": {
+    "enabled": true,
+    "initial_balance_krw": 0,
+    "fee_rate": 0.0005,
+    "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"],
+    "cycle_seconds": 60,
+    "position_size_pct": 0.15
+  },
+  "safety": {
+    "live_trading_enabled": true,
+    "max_daily_loss_rate": -0.03,
+    "max_mdd_rate": -0.05,
+    "max_single_coin_weight": 0.25,
+    "max_positions": 7,
+    "cooldown_cycles": 5,
+    "emergency_stop": false,
+    "forced_sell": {
+      "stop_loss_pct": -6.0,
+      "take_profit_pct": 10.0,
+      "max_hold_hours": 72
+    },
+    "cascading_cut": {
+      "enabled": true,
+      "thresholds": [
+        [2, -1.5],
+        [4, 0.0],
+        [8, 0.5],
+        [16, 1.0]
+      ]
+    },
+    "trailing_stop": {
+      "enabled": true,
+      "activation_pct": 5.0,
+      "distance_pct": 3.0
+    }
+  },
+  "strategy": {
+    "name": "trendrider",
+    "params": {
+      "ema_fast": 9,
+      "ema_slow": 16,
+      "rsi_period": 16,
+      "rsi_pullback_low": 30,
+      "rsi_pullback_high": 65,
+      "rsi_bounce_level": 35,
+      "adx_threshold": 18,
+      "volume_factor": 0.7,
+      "rsi_exit": 78,
+      "min_confidence_bull": 5,
+      "min_confidence_bear": 6,
+      "use_4h": false,
+      "use_1d": false,
+      "use_btc_sentiment": true,
+      "interval": "60"
+    }
+  },
+  "rsi_fallback": {
+    "enabled": false
+  }
+}
