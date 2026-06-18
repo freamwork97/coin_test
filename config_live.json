@@ -52,8 +52,8 @@
       "rsi_exit": 78,
       "min_confidence_bull": 5,
       "min_confidence_bear": 6,
-      "use_4h": false,
-      "use_1d": false,
+      "use_4h": true,
+      "use_1d": true,
       "use_btc_sentiment": true,
       "interval": "60"
     }
