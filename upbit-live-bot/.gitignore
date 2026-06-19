@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
+*.bak
 logs/
 runtime/
 data/
-*.bak
 .env
 secrets/

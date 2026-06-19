@@ -6,7 +6,7 @@
     "enabled": true,
     "initial_balance_krw": 0,
     "fee_rate": 0.0005,
-    "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"],
+    "markets": ["KRW-XLM", "KRW-XRP", "KRW-BTC", "KRW-WLD", "KRW-ETH", "KRW-ONDO", "KRW-MEGA", "KRW-SOL", "KRW-TRUST", "KRW-BIO", "KRW-NEAR", "KRW-DOGE", "KRW-JTO", "KRW-AERGO", "KRW-BLEND", "KRW-CHIP", "KRW-AQT", "KRW-SUI", "KRW-SAHARA", "KRW-XPL", "KRW-PROS", "KRW-MET2", "KRW-ENA", "KRW-IP", "KRW-SPX", "KRW-AVAX", "KRW-KERNEL", "KRW-ID", "KRW-CHZ", "KRW-ADA", "KRW-VIRTUAL", "KRW-PENGU", "KRW-UNI", "KRW-BCH", "KRW-TRUMP", "KRW-CFG", "KRW-ORCA", "KRW-SLX", "KRW-MOVE", "KRW-LINK", "KRW-ZBT", "KRW-RENDER", "KRW-ZKP", "KRW-BLUR", "KRW-WAL", "KRW-IRYS", "KRW-AERO", "KRW-PLUME", "KRW-TAO", "KRW-ALGO"],
     "cycle_seconds": 60,
     "position_size_pct": 0.15
   },
@@ -51,7 +51,7 @@
       "volume_factor": 0.7,
       "rsi_exit": 78,
       "min_confidence_bull": 5,
-      "min_confidence_bear": 6,
+      "min_confidence_bear": 5,
       "use_4h": true,
       "use_1d": true,
       "use_btc_sentiment": true,
@@ -59,6 +59,12 @@
     }
   },
   "rsi_fallback": {
-    "enabled": false
+    "enabled": true,
+    "params": {
+      "period": 14,
+      "overbought": 70,
+      "oversold": 30,
+      "interval": "60"
+    }
   }
 }

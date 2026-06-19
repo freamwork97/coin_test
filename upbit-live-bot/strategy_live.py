@@ -307,7 +307,7 @@ class TrendRiderStyleStrategy(BaseStrategy):
         # Rate limit: candle group = 10 req/s. With 5 markets + BTC + 4h + 1d,
         # we need to spread requests. Remaining-Req header tracking in live_api
         # handles adaptive throttling; we add a small inter-request delay.
-        self._candle_delay = 0.20  # 200ms between candle requests (10 req/s = 100ms min, safe margin)
+        self._candle_delay = 0.10  # 100ms between candle requests (10 req/s = 100ms min)
 
     # ------------------------------------------------------------------
     # Indicator calculation for a single market

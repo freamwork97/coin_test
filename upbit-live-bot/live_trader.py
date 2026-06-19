@@ -171,14 +171,44 @@ class LiveTrader:
     # Status for monitoring
     # ------------------------------------------------------------------
     def get_status(self) -> Dict:
-        pv = self.get_portfolio_value()
-        krw = self.get_krw_balance()
-        positions = self.get_positions()
-        unreal = self.get_unrealized_pnl()
-        positions_value = sum(
-            positions[m] * (self.api.get_ticker([m])[0]["trade_price"] if self.api.get_ticker([m]) else 0)
-            for m in positions
-        )
+        """Get full status with minimal API calls — accounts once, ticker once."""
+        accounts = self.api.get_accounts()
+        positions = self.api.get_positions_from_exchange()
+
+        # Extract KRW from accounts
+        krw = 0.0
+        for acc in accounts:
+            if acc["currency"] == "KRW":
+                krw = float(acc["balance"])
+                break
+
+        # Get ticker once for all positions
+        ticker_map: Dict[str, float] = {}
+        if positions:
+            tickers = self.api.get_ticker(list(positions.keys()))
+            ticker_map = {tk["market"]: tk["trade_price"] for tk in tickers}
+
+        # Portfolio value
+        pv = krw
+        positions_value = 0.0
+        for m, vol in positions.items():
+            price = ticker_map.get(m, 0.0)
+            pv += vol * price
+            positions_value += vol * price
+
+        # Unrealized PnL (from accounts avg_buy_price, no extra API call)
+        unreal: Dict[str, float] = {}
+        for m, vol in positions.items():
+            currency = m.replace("KRW-", "")
+            avg_price = 0.0
+            for acc in accounts:
+                if acc["currency"] == currency:
+                    avg = acc.get("avg_buy_price", "0")
+                    if avg and float(avg) > 0:
+                        avg_price = float(avg)
+                    break
+            if avg_price > 0 and m in ticker_map:
+                unreal[m] = (ticker_map[m] - avg_price) * vol
 
         return {
             "timestamp": datetime.now().isoformat(),

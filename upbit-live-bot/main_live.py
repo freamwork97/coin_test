@@ -212,9 +212,10 @@ class LiveSafetyManager:
 
         return None
 
-    def check_forced_sell(self, market: str, trader: LiveTrader) -> Optional[str]:
+    def check_forced_sell(self, market: str, trader: LiveTrader, ticker_map: Optional[Dict[str, float]] = None) -> Optional[str]:
         """Check if a position should be force-sold based on stop-loss/take-profit/hold time/cascade/trailing.
-        Returns reason string if forced-sell is needed, None otherwise."""
+        Returns reason string if forced-sell is needed, None otherwise.
+        ticker_map: optional pre-fetched {market: trade_price} to avoid redundant API calls."""
         positions = trader.get_positions()
         if market not in positions:
             return None
@@ -223,11 +224,14 @@ class LiveSafetyManager:
         if not avg_price:
             return None
 
-        # Get current price
-        tickers = trader.api.get_ticker([market])
-        if not tickers:
-            return None
-        current_price = tickers[0]["trade_price"]
+        # Get current price — use ticker_map if provided, else fetch individually
+        if ticker_map and market in ticker_map:
+            current_price = ticker_map[market]
+        else:
+            tickers = trader.api.get_ticker([market])
+            if not tickers:
+                return None
+            current_price = tickers[0]["trade_price"]
 
         pnl_pct = (current_price - avg_price) / avg_price * 100
 
@@ -362,8 +366,13 @@ class LiveBot:
 
                 # 1.5 Forced-sell check: stop-loss / take-profit / max hold time
                 positions = self.trader.get_positions()
+                # Pre-fetch ticker once for all positions
+                ticker_map: Dict[str, float] = {}
+                if positions:
+                    tickers = self.api.get_ticker(list(positions.keys()))
+                    ticker_map = {tk["market"]: tk["trade_price"] for tk in tickers}
                 for market in list(positions.keys()):
-                    reason = self.safety.check_forced_sell(market, self.trader)
+                    reason = self.safety.check_forced_sell(market, self.trader, ticker_map)
                     if reason:
                         logger.warning("FORCED SELL %s — %s", market, reason)
                         self.trader.sell(market)

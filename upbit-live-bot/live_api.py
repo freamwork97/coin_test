@@ -50,6 +50,10 @@ class LiveUpbitAPI:
         self._rate_limits: Dict[str, int] = {}  # group → remaining sec
         self._rate_limit_lock = __import__('threading').Lock()
 
+        # Accounts cache — 1s TTL to avoid redundant /accounts calls within a cycle
+        self._accounts_cache: Optional[List[Dict]] = None
+        self._accounts_cache_time: float = 0.0
+
     def _update_rate_limit(self, resp):
         """Parse Remaining-Req header and update rate limit tracking."""
         header = resp.headers.get("Remaining-Req", "")
@@ -168,8 +172,15 @@ class LiveUpbitAPI:
     # Private API — Account
     # ------------------------------------------------------------------
     def get_accounts(self) -> List[Dict]:
-        """Get all balances."""
-        return self._request("GET", "/accounts") or []
+        """Get all balances. Cached with 1s TTL to avoid redundant calls within a cycle."""
+        import time as _time
+        now = _time.time()
+        if self._accounts_cache is not None and (now - self._accounts_cache_time) < 1.0:
+            return self._accounts_cache
+        result = self._request("GET", "/accounts") or []
+        self._accounts_cache = result
+        self._accounts_cache_time = now
+        return result
 
     def get_krw_balance(self) -> float:
         """Get available KRW balance."""
