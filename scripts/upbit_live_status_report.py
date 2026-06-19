@@ -9,7 +9,7 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-BOT_DIR = Path('/home/windra/.openclaw/workspace')
+BOT_DIR = Path('/home/windra/.openclaw/workspace/upbit-live-bot')
 STATUS_FILE = BOT_DIR / 'runtime/status.json'
 TRADES_FILE = BOT_DIR / 'data/live_trades.jsonl'
 EQUITY_FILE = BOT_DIR / 'data/live_equity_curve.csv'
