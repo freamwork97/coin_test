@@ -18,7 +18,7 @@ from live_api import LiveUpbitAPI
 
 logger = logging.getLogger(__name__)
 
-BOT_DIR = os.path.expanduser("~/.openclaw/workspace/upbit-live-bot")
+BOT_DIR = os.path.expanduser("~/.openclaw/workspace")
 DATA_DIR = os.path.join(BOT_DIR, "data")
 RUNTIME_DIR = os.path.join(BOT_DIR, "runtime")
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.jsonl")
