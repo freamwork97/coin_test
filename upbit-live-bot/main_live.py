@@ -17,7 +17,7 @@ import signal
 from datetime import datetime
 from typing import Dict, Optional, Set
 
-BOT_DIR = os.path.expanduser("~/.openclaw/workspace")
+BOT_DIR = os.path.expanduser("~/.openclaw/workspace/upbit-live-bot")
 LOG_DIR = os.path.join(BOT_DIR, "logs")
 RUNTIME_DIR = os.path.join(BOT_DIR, "runtime")
 os.makedirs(LOG_DIR, exist_ok=True)
