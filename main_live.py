@@ -119,6 +119,8 @@ class LiveSafetyManager:
                 return self._current_regime
 
             prices = [c["trade_price"] for c in candles]
+            # Upbit API returns newest-first; reverse to chronological order
+            prices.reverse()
 
             # Calculate EMAs
             def _ema(data, period):
