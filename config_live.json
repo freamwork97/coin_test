@@ -36,6 +36,30 @@
       "enabled": true,
       "activation_pct": 5.0,
       "distance_pct": 3.0
+    },
+    "bear_market": {
+      "enabled": true,
+      "btc_ma_fast": 50,
+      "btc_ma_slow": 200,
+      "btc_interval": "60",
+      "regimes": {
+        "bull": {
+          "max_positions": 7,
+          "position_size_pct": 0.15,
+          "min_confidence": 5
+        },
+        "neutral": {
+          "max_positions": 4,
+          "position_size_pct": 0.10,
+          "min_confidence": 6
+        },
+        "bear": {
+          "max_positions": 2,
+          "position_size_pct": 0.05,
+          "min_confidence": 7
+        }
+      },
+      "cache_ttl_seconds": 300
     }
   },
   "strategy": {

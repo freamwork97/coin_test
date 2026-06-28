@@ -87,8 +87,84 @@ class LiveSafetyManager:
         self.trailing_activation_pct = self.trailing_stop.get("activation_pct", 5.0)   # activate after +5%
         self.trailing_distance_pct = self.trailing_stop.get("distance_pct", 3.0)       # trail by 3%
 
+        # Bear market regime detection (V5)
+        self.bear_market = s.get("bear_market", {})
+        self.bear_enabled = self.bear_market.get("enabled", True)
+        self.btc_ma_fast = self.bear_market.get("btc_ma_fast", 50)
+        self.btc_ma_slow = self.bear_market.get("btc_ma_slow", 200)
+        self.btc_interval = self.bear_market.get("btc_interval", "60")
+        self.regimes = self.bear_market.get("regimes", {})
+        self.regime_cache_ttl = self.bear_market.get("cache_ttl_seconds", 300)
+        self._regime_cache: tuple = (0, "bull")  # (timestamp, regime)
+        self._current_regime: str = "bull"
+
     def advance_cycle(self):
         self.cycle_count += 1
+
+    def detect_market_regime(self, api) -> str:
+        """Detect market regime using BTC MA50/MA200 on 1h candles.
+        Returns 'bull', 'neutral', or 'bear'. Cached for regime_cache_ttl seconds."""
+        if not self.bear_enabled:
+            return "bull"
+
+        now = time.time()
+        cache_ts, cached_regime = self._regime_cache
+        if now - cache_ts < self.regime_cache_ttl:
+            return cached_regime
+
+        try:
+            candles = api.get_candles("KRW-BTC", self.btc_interval, max(self.btc_ma_slow + 10, 210))
+            if len(candles) < self.btc_ma_slow:
+                logger.warning("BTC candles insufficient for regime detection (%d < %d)", len(candles), self.btc_ma_slow)
+                return self._current_regime
+
+            prices = [c["trade_price"] for c in candles]
+
+            # Calculate EMAs
+            def _ema(data, period):
+                if len(data) < period:
+                    return None
+                multiplier = 2 / (period + 1)
+                ema = sum(data[:period]) / period
+                for i in range(period, len(data)):
+                    ema = (data[i] - ema) * multiplier + ema
+                return ema
+
+            ema50 = _ema(prices, self.btc_ma_fast)
+            ema200 = _ema(prices, self.btc_ma_slow)
+            current_price = prices[-1]
+
+            if ema50 is None or ema200 is None:
+                return self._current_regime
+
+            # Regime logic: Bull > Neutral > Bear
+            if current_price > ema50 > ema200:
+                regime = "bull"
+            elif current_price > ema200:
+                regime = "neutral"
+            else:
+                regime = "bear"
+
+            self._regime_cache = (now, regime)
+            if regime != self._current_regime:
+                logger.info(
+                    "Market regime changed: %s → %s (BTC=₩%.0f, MA50=₩%.0f, MA200=₩%.0f)",
+                    self._current_regime, regime, current_price, ema50, ema200,
+                )
+            self._current_regime = regime
+            return regime
+
+        except Exception as e:
+            logger.warning("Market regime detection failed: %s", e)
+            return self._current_regime
+
+    def _get_effective_limits(self):
+        """Get regime-aware max_positions and position_size_pct."""
+        regime_cfg = self.regimes.get(self._current_regime, {})
+        effective_max = regime_cfg.get("max_positions", self.max_positions)
+        effective_size = regime_cfg.get("position_size_pct", 0.15)
+        effective_min_conf = regime_cfg.get("min_confidence", 5)
+        return effective_max, effective_size, effective_min_conf
 
     def check(self, trader: LiveTrader) -> dict:
         violations = []
@@ -108,9 +184,10 @@ class LiveSafetyManager:
         #    can_buy() already enforces the limit; blocking here would also
         #    prevent SELL signals from executing, causing positions to be
         #    trapped during uptrends.
-        if len(positions) >= self.max_positions:
-            logger.info("Max positions reached (%d >= %d) — buys blocked, sells still allowed",
-                        len(positions), self.max_positions)
+        effective_max, _, _ = self._get_effective_limits()
+        if len(positions) >= effective_max:
+            logger.info("Max positions reached (%d >= %d, regime=%s) — buys blocked, sells still allowed",
+                        len(positions), effective_max, self._current_regime)
 
         # 3. MDD
         mdd = (trader.peak_value - pv) / trader.peak_value if trader.peak_value > 0 else 0
@@ -145,8 +222,13 @@ class LiveSafetyManager:
         if market in positions:
             return False
 
+        # Regime-aware max positions
+        effective_max, _, _ = self._get_effective_limits()
+
         # Max positions
-        if len(positions) >= self.max_positions:
+        if len(positions) >= effective_max:
+            logger.info("Max positions reached (%d >= %d, regime=%s) — buys blocked",
+                        len(positions), effective_max, self._current_regime)
             return False
 
         # Cooldown after selling this market
@@ -313,6 +395,14 @@ class LiveBot:
         logger.info("  Initial KRW: ₩%.0f", self.trader.initial_balance)
         logger.info("  Position size: %.0f%%", self.trader.position_size_pct * 100)
         logger.info("  Max positions: %d", self.safety.max_positions)
+        if self.safety.bear_enabled:
+            logger.info("  Bear market filter: ENABLED (bull=%dpos/%.0f%%, neutral=%dpos/%.0f%%, bear=%dpos/%.0f%%)",
+                        self.safety.regimes.get("bull", {}).get("max_positions", 7),
+                        self.safety.regimes.get("bull", {}).get("position_size_pct", 0.15) * 100,
+                        self.safety.regimes.get("neutral", {}).get("max_positions", 4),
+                        self.safety.regimes.get("neutral", {}).get("position_size_pct", 0.10) * 100,
+                        self.safety.regimes.get("bear", {}).get("max_positions", 2),
+                        self.safety.regimes.get("bear", {}).get("position_size_pct", 0.05) * 100)
         if self.rsi_enabled:
             logger.info("  RSI fallback: ENABLED (oversold<%.0f, overbought>%.0f)",
                         self.rsi_strategy.oversold, self.rsi_strategy.overbought)
@@ -356,6 +446,9 @@ class LiveBot:
             cycle_start = time.time()
             try:
                 self.safety.advance_cycle()
+
+                # 0. Market regime detection (V5)
+                self.safety.detect_market_regime(self.api)
 
                 # 1. Safety check
                 safety_result = self.safety.check(self.trader)
@@ -423,9 +516,16 @@ class LiveBot:
 
                     if sig.side == "buy":
                         if self.safety.can_buy(sig.market, self.trader):
-                            # Calculate position size based on current KRW
+                            # Calculate position size based on current KRW (regime-aware)
                             krw = self.trader.get_krw_balance()
-                            amount = krw * self.trader.position_size_pct
+                            _, effective_size, effective_min_conf = self.safety._get_effective_limits()
+                            amount = krw * effective_size
+
+                            # Regime-aware confidence filter
+                            if sig.confidence * 100 < effective_min_conf:
+                                logger.info("Signal BUY %s rejected — confidence %.1f%% < %d (regime=%s)",
+                                            sig.market, sig.confidence * 100, effective_min_conf, self.safety._current_regime)
+                                continue
                             if amount >= 5000:
                                 logger.info("Signal: BUY %s (%.1f%% conf) — %s", sig.market, sig.confidence * 100, sig.reason)
                                 result = self.trader.buy(sig.market, amount)
