@@ -60,6 +60,16 @@
         }
       },
       "cache_ttl_seconds": 300
+    },
+    "market_breadth": {
+      "enabled": true,
+      "ema_period": 50,
+      "interval": "60",
+      "thresholds": [
+        [30, 1],
+        [50, 2]
+      ],
+      "cache_ttl_seconds": 600
     }
   },
   "strategy": {

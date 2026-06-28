@@ -98,6 +98,16 @@ class LiveSafetyManager:
         self._regime_cache: tuple = (0, "bull")  # (timestamp, regime)
         self._current_regime: str = "bull"
 
+        # Market breadth detection (V6)
+        self.market_breadth = s.get("market_breadth", {})
+        self.breadth_enabled = self.market_breadth.get("enabled", True)
+        self.breadth_ema_period = self.market_breadth.get("ema_period", 50)
+        self.breadth_interval = self.market_breadth.get("interval", "60")
+        self.breadth_thresholds = self.market_breadth.get("thresholds", [[30, 1], [50, 2]])
+        self.breadth_cache_ttl = self.market_breadth.get("cache_ttl_seconds", 600)
+        self._breadth_cache: tuple = (0, 100.0)  # (timestamp, breadth_pct)
+        self._current_breadth: float = 100.0     # % of coins above EMA50
+
     def advance_cycle(self):
         self.cycle_count += 1
 
@@ -160,12 +170,79 @@ class LiveSafetyManager:
             logger.warning("Market regime detection failed: %s", e)
             return self._current_regime
 
+    def detect_market_breadth(self, api, markets: list) -> float:
+        """Calculate market breadth: % of markets above their EMA50 on 1h candles.
+        Returns breadth percentage (0-100). Cached for breadth_cache_ttl seconds."""
+        if not self.breadth_enabled:
+            return 100.0
+
+        now = time.time()
+        cache_ts, cached_breadth = self._breadth_cache
+        if now - cache_ts < self.breadth_cache_ttl:
+            return cached_breadth
+
+        try:
+            above_ema = 0
+            total = 0
+            for market in markets:
+                try:
+                    candles = api.get_candles(market, self.breadth_interval, self.breadth_ema_period + 5)
+                    if len(candles) < self.breadth_ema_period:
+                        continue
+                    # Upbit API returns newest-first; reverse to chronological
+                    prices = [c["trade_price"] for c in reversed(candles)]
+
+                    # Calculate EMA
+                    multiplier = 2 / (self.breadth_ema_period + 1)
+                    ema = sum(prices[:self.breadth_ema_period]) / self.breadth_ema_period
+                    for i in range(self.breadth_ema_period, len(prices)):
+                        ema = (prices[i] - ema) * multiplier + ema
+
+                    if prices[-1] > ema:
+                        above_ema += 1
+                    total += 1
+                except Exception:
+                    continue
+
+            if total == 0:
+                return self._current_breadth
+
+            breadth = (above_ema / total) * 100
+            self._breadth_cache = (now, breadth)
+
+            if abs(breadth - self._current_breadth) > 5:
+                logger.info(
+                    "Market breadth: %.1f%% (%d/%d markets above EMA%d)",
+                    breadth, above_ema, total, self.breadth_ema_period,
+                )
+            self._current_breadth = breadth
+            return breadth
+
+        except Exception as e:
+            logger.warning("Market breadth detection failed: %s", e)
+            return self._current_breadth
+
     def _get_effective_limits(self):
-        """Get regime-aware max_positions and position_size_pct."""
+        """Get regime-aware max_positions and position_size_pct, with breadth modifier."""
         regime_cfg = self.regimes.get(self._current_regime, {})
         effective_max = regime_cfg.get("max_positions", self.max_positions)
         effective_size = regime_cfg.get("position_size_pct", 0.15)
         effective_min_conf = regime_cfg.get("min_confidence", 5)
+
+        # Apply market breadth modifier (V6)
+        if self.breadth_enabled:
+            breadth = self._current_breadth
+            reduction = 0
+            for threshold, reduce_by in self.breadth_thresholds:
+                if breadth < threshold:
+                    reduction = max(reduction, reduce_by)
+            if reduction > 0:
+                effective_max = max(1, effective_max - reduction)
+                logger.debug(
+                    "Breadth modifier: %.1f%% < thresholds → max_positions reduced by %d (now %d)",
+                    breadth, reduction, effective_max,
+                )
+
         return effective_max, effective_size, effective_min_conf
 
     def check(self, trader: LiveTrader) -> dict:
@@ -408,6 +485,10 @@ class LiveBot:
         if self.rsi_enabled:
             logger.info("  RSI fallback: ENABLED (oversold<%.0f, overbought>%.0f)",
                         self.rsi_strategy.oversold, self.rsi_strategy.overbought)
+        if self.safety.breadth_enabled:
+            logger.info("  Market breadth: ENABLED (EMA%d, thresholds: %s)",
+                        self.safety.breadth_ema_period,
+                        ", ".join(f"<{t}%→-{r}pos" for t, r in self.safety.breadth_thresholds))
 
     def _market_summary(self) -> str:
         """30사이클마다 호출: 각 종목의 MA10/MA30/MA50 스냅샷을 한 줄로."""
@@ -452,6 +533,10 @@ class LiveBot:
 
                 # 0. Market regime detection (V5)
                 self.safety.detect_market_regime(self.api)
+
+                # 0.5 Market breadth detection (V6) — every 10 cycles to avoid rate limits
+                if cycle_num % 10 == 1:
+                    self.safety.detect_market_breadth(self.api, self.markets)
 
                 # 1. Safety check
                 safety_result = self.safety.check(self.trader)
