@@ -43,7 +43,7 @@ sys.path.insert(0, BOT_DIR)
 
 from live_api import LiveUpbitAPI
 from live_trader import LiveTrader
-from strategy_live import get_strategy, Signal, RSIStrategy
+from strategy_live import get_strategy, Signal, RSIStrategy, MeanReversionStrategy
 from performance import PerformanceMetrics
 
 
@@ -456,6 +456,17 @@ class LiveBot:
                 "params": rsi_cfg.get("params", {"period": 14, "overbought": 70, "oversold": 30, "interval": "60"}),
             })
 
+        # Mean reversion strategy (V7) — bear/ranging market용
+        mr_cfg = self.config.get("mean_reversion", {})
+        self.mr_enabled = mr_cfg.get("enabled", True)
+        self.mr_regimes = mr_cfg.get("regimes", ["neutral", "bear"])
+        self.mr_strategy = None
+        if self.mr_enabled:
+            self.mr_strategy = MeanReversionStrategy({
+                "name": "mean_reversion",
+                "params": mr_cfg.get("params", {}),
+            })
+
         self.markets = self.config["live_trading"]["markets"]
         self.cycle_seconds = self.config["live_trading"]["cycle_seconds"]
         self.running = False
@@ -489,6 +500,10 @@ class LiveBot:
             logger.info("  Market breadth: ENABLED (EMA%d, thresholds: %s)",
                         self.safety.breadth_ema_period,
                         ", ".join(f"<{t}%→-{r}pos" for t, r in self.safety.breadth_thresholds))
+        if self.mr_enabled:
+            logger.info("  Mean reversion: ENABLED (RSI<%.0f→buy, RSI>%.0f→sell, regimes=%s, size=%.0f%%)",
+                        self.mr_strategy.rsi_oversold, self.mr_strategy.rsi_exit,
+                        ",".join(self.mr_regimes), self.mr_strategy.position_size_pct * 100)
 
     def _market_summary(self) -> str:
         """30사이클마다 호출: 각 종목의 MA10/MA30/MA50 스냅샷을 한 줄로."""
@@ -561,10 +576,20 @@ class LiveBot:
                         self.trader.sell(market)
                         self.safety.on_sell(market)
 
-                # 2. Generate signals (primary: MA Crossover)
+                # 2. Generate signals (primary: TrendRider)
                 signals = self.strategy.generate_signals(self.api, self.markets)
 
-                # 2a. RSI fallback: MA 신호가 없으면 RSI도 확인
+                # 2a. Mean reversion (V7): neutral/bear regime에서 TrendRider 신호 없을 때
+                if not signals and self.mr_strategy and self.safety._current_regime in self.mr_regimes:
+                    try:
+                        mr_signals = self.mr_strategy.generate_signals(self.api, self.markets)
+                        if mr_signals:
+                            logger.info("Mean reversion generated %d signal(s) (regime=%s)", len(mr_signals), self.safety._current_regime)
+                            signals.extend(mr_signals)
+                    except Exception as e:
+                        logger.error("Mean reversion error: %s", e)
+
+                # 2b. RSI fallback: 여전히 신호 없으면 RSI도 확인
                 if not signals and self.rsi_strategy:
                     try:
                         rsi_signals = self.rsi_strategy.generate_signals(self.api, self.markets)

@@ -100,5 +100,25 @@
       "oversold": 30,
       "interval": "60"
     }
+  },
+  "mean_reversion": {
+    "enabled": true,
+    "params": {
+      "rsi_period": 14,
+      "rsi_oversold": 25,
+      "rsi_exit": 55,
+      "bb_period": 20,
+      "bb_std": 2.0,
+      "bb_position_max": 0.15,
+      "volume_ratio_min": 1.0,
+      "take_profit_pct": 3.0,
+      "stop_loss_pct": -4.0,
+      "max_hold_hours": 8,
+      "position_size_pct": 0.03,
+      "max_positions": 2,
+      "btc_rsi_min": 30,
+      "interval": "60"
+    },
+    "regimes": ["neutral", "bear"]
   }
 }

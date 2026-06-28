@@ -1043,6 +1043,122 @@ class MACrossoverStrategy(EnhancedMACrossoverStrategy):
         return signals
 
 
+# ============================================================================
+# Mean Reversion Strategy (V7) — bear/ranging market용 단기 반등 포착
+# ============================================================================
+
+class MeanReversionStrategy(BaseStrategy):
+    """Mean reversion for bear/ranging markets.
+    
+    Entry: RSI < oversold + price near BB lower + volume confirmation + BTC filter
+    Exit:  RSI > exit threshold OR take-profit OR stop-loss OR max hold time
+    
+    Designed to complement TrendRider — only active in neutral/bear regimes.
+    """
+
+    def __init__(self, config: Dict):
+        super().__init__(config)
+        p = self.params
+
+        self.rsi_period = p.get("rsi_period", 14)
+        self.rsi_oversold = p.get("rsi_oversold", 25)
+        self.rsi_exit = p.get("rsi_exit", 55)
+        self.bb_period = p.get("bb_period", 20)
+        self.bb_std = p.get("bb_std", 2.0)
+        self.bb_position_max = p.get("bb_position_max", 0.15)
+        self.volume_ratio_min = p.get("volume_ratio_min", 1.0)
+        self.take_profit_pct = p.get("take_profit_pct", 3.0)
+        self.stop_loss_pct = p.get("stop_loss_pct", -4.0)
+        self.max_hold_hours = p.get("max_hold_hours", 8)
+        self.position_size_pct = p.get("position_size_pct", 0.03)
+        self.max_positions = p.get("max_positions", 2)
+        self.btc_rsi_min = p.get("btc_rsi_min", 30)
+        self.interval = p.get("interval", "60")
+
+    def generate_signals(self, api, markets: List[str]) -> List[Signal]:
+        import time as _time
+        signals = []
+
+        # Get BTC RSI for filter
+        btc_rsi = 50
+        try:
+            btc_candles = self.get_candles(api, "KRW-BTC", self.interval, self.rsi_period + 5)
+            if len(btc_candles) >= self.rsi_period:
+                btc_prices = [c["trade_price"] for c in reversed(btc_candles)]
+                btc_rsi = _rsi(btc_prices, self.rsi_period)[-1]
+                if btc_rsi != btc_rsi:  # NaN check
+                    btc_rsi = 50
+        except Exception:
+            pass
+
+        # BTC filter: don't catch falling knives
+        if btc_rsi < self.btc_rsi_min:
+            logger.debug("Mean reversion: BTC RSI %.1f < %d — skipping", btc_rsi, self.btc_rsi_min)
+            return signals
+
+        for market in markets:
+            try:
+                candles = self.get_candles(api, market, self.interval, max(self.bb_period, self.rsi_period) + 10)
+                if len(candles) < self.bb_period:
+                    continue
+
+                # Upbit API returns newest-first; reverse to chronological
+                closes = [c["trade_price"] for c in reversed(candles)]
+                highs = [c["high_price"] for c in reversed(candles)]
+                lows = [c["low_price"] for c in reversed(candles)]
+                volumes = [c["candle_acc_trade_volume"] for c in reversed(candles)]
+
+                # RSI
+                rsi_vals = _rsi(closes, self.rsi_period)
+                rsi = rsi_vals[-1]
+                if rsi != rsi:  # NaN
+                    continue
+
+                # Bollinger Bands
+                bb_upper, bb_middle, bb_lower = _bb(closes, self.bb_period, self.bb_std)
+                if bb_lower[-1] != bb_lower[-1]:  # NaN
+                    continue
+
+                close = closes[-1]
+                bb_pos = (close - bb_lower[-1]) / (bb_upper[-1] - bb_lower[-1] + 1e-10)
+
+                # Volume ratio
+                vol_ema = _ema(volumes, 20)
+                vol_ratio = volumes[-1] / (vol_ema[-1] + 1e-10) if vol_ema[-1] == vol_ema[-1] else 0
+
+                # === ENTRY: RSI oversold + near BB lower + volume ===
+                if rsi < self.rsi_oversold and bb_pos < self.bb_position_max and vol_ratio > self.volume_ratio_min:
+                    confidence = min(1.0, (self.rsi_oversold - rsi) / self.rsi_oversold * 0.8)
+                    signals.append(Signal(
+                        market=market,
+                        side="buy",
+                        confidence=confidence,
+                        reason=f"Mean reversion: RSI={rsi:.1f}<{self.rsi_oversold}, BB pos={bb_pos:.2f}",
+                        params={
+                            "entry_tag": "mean_reversion",
+                            "rsi": rsi,
+                            "bb_position": bb_pos,
+                            "volume_ratio": vol_ratio,
+                            "btc_rsi": btc_rsi,
+                        },
+                    ))
+
+                # === EXIT: RSI recovered OR take-profit/stop-loss handled by safety ===
+                elif rsi > self.rsi_exit:
+                    signals.append(Signal(
+                        market=market,
+                        side="sell",
+                        confidence=0.7,
+                        reason=f"Mean reversion exit: RSI={rsi:.1f}>{self.rsi_exit}",
+                        params={"exit_tag": "mean_reversion_rsi_exit", "rsi": rsi},
+                    ))
+
+            except Exception as e:
+                logger.error("Mean reversion signal error %s: %s", market, e)
+
+        return signals
+
+
 def get_strategy(config: Dict) -> BaseStrategy:
     name = config.get("name", "ma_crossover")
     if name == "ma_crossover":
