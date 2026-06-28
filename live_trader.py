@@ -104,14 +104,25 @@ class LiveTrader:
             logger.error("Market buy failed for %s", market)
             return None
 
+        # Retrieve actual execution details (POST response lacks executed_volume/paid_fee)
+        uuid = order.get("uuid")
+        executed_volume = "0"
+        paid_fee = "0"
+        if uuid:
+            time.sleep(0.3)  # brief wait for order to settle
+            detail = self.api.get_order(uuid)
+            if detail:
+                executed_volume = str(detail.get("executed_volume", "0") or "0")
+                paid_fee = str(detail.get("paid_fee", "0") or "0")
+
         # Record trade
         trade = {
-            "uuid": order.get("uuid"),
+            "uuid": uuid,
             "market": market,
             "side": "buy",
             "amount_krw": amount_krw,
-            "volume_executed": order.get("executed_volume") or order.get("volume"),
-            "fee": order.get("paid_fee", 0),
+            "volume_executed": executed_volume,
+            "fee": paid_fee,
             "timestamp": order.get("created_at") or datetime.now().isoformat(),
         }
         self._record_trade(trade)
@@ -136,13 +147,28 @@ class LiveTrader:
             logger.error("Market sell failed for %s", market)
             return None
 
+        # Retrieve actual execution details (POST response lacks executed_volume/paid_fee)
+        uuid = order.get("uuid")
+        executed_volume = "0"
+        paid_fee = "0"
+        executed_funds = "0"
+        detail = None
+        if uuid:
+            time.sleep(0.3)  # brief wait for order to settle
+            detail = self.api.get_order(uuid)
+            if detail:
+                executed_volume = str(detail.get("executed_volume", "0") or "0")
+                paid_fee = str(detail.get("paid_fee", "0") or "0")
+                executed_funds = str(detail.get("executed_funds", "0") or "0")
+
         trade = {
-            "uuid": order.get("uuid"),
+            "uuid": uuid,
             "market": market,
             "side": "sell",
             "volume": volume,
-            "volume_executed": order.get("executed_volume") or volume,
-            "fee": order.get("paid_fee", 0),
+            "volume_executed": executed_volume,
+            "executed_funds": executed_funds,
+            "fee": paid_fee,
             "timestamp": order.get("created_at") or datetime.now().isoformat(),
         }
         self._record_trade(trade)

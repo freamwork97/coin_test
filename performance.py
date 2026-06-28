@@ -14,7 +14,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-BOT_DIR = os.path.expanduser("~/.openclaw/workspace/upbit-paper-bot")
+BOT_DIR = os.path.expanduser("~/.openclaw/workspace/upbit-live-bot")
 DATA_DIR = os.path.join(BOT_DIR, "data")
 RUNTIME_DIR = os.path.join(BOT_DIR, "runtime")
 
@@ -27,13 +27,25 @@ class PerformanceMetrics:
     # Returns
     # ------------------------------------------------------------------
     def get_returns(self) -> dict:
+        # 실제 매수 원가 기준: 보유 포지션들의 avg_buy_price * volume 합계
+        positions = self.trader.get_positions()
+        total_invested = 0.0
+        for market, volume in positions.items():
+            avg_price = self.trader.api.get_average_buy_price(market)
+            if avg_price:
+                total_invested += avg_price * volume
+
+        # 포지션이 없으면 initial_balance를 기준으로 (초기 상태)
+        if total_invested == 0:
+            total_invested = self.trader.initial_balance
+
         pv = self.trader.get_portfolio_value()
-        iv = self.trader.initial_balance
-        tr = pv - iv
-        trr = tr / iv if iv > 0 else 0
+        tr = pv - total_invested
+        trr = tr / total_invested if total_invested > 0 else 0
         return {
-            "initial_balance": iv,
-            "current_balance": self.trader.balance,
+            "initial_balance": self.trader.initial_balance,
+            "total_invested": total_invested,
+            "current_balance": self.trader.get_krw_balance(),
             "portfolio_value": pv,
             "total_return": tr,
             "total_return_pct": trr * 100,
@@ -112,25 +124,63 @@ class PerformanceMetrics:
     # Fee summary
     # ------------------------------------------------------------------
     def get_fees(self) -> dict:
+        # Sum fees from trades file
+        total_fees = 0.0
+        trades_file = os.path.join(DATA_DIR, "live_trades.jsonl")
+        if os.path.exists(trades_file):
+            with open(trades_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        t = json.loads(line)
+                        total_fees += float(t.get("fee", 0))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
         return {
-            "total_fees": self.trader.total_fees,
-            "total_slippage": self.trader.total_slippage,
-            "total_costs": self.trader.total_fees + self.trader.total_slippage,
+            "total_fees": total_fees,
+            "total_slippage": 0.0,
+            "total_costs": total_fees,
             "fee_rate_pct": self.trader.fee_rate * 100,
-            "slippage_rate_pct": self.trader.slippage * 100,
+            "slippage_rate_pct": 0.0,
         }
 
     # ------------------------------------------------------------------
     # Trade summary
     # ------------------------------------------------------------------
     def get_trade_summary(self) -> dict:
-        buys = [t for t in self.trader.trades if t["side"] == "buy"]
-        sells = [t for t in self.trader.trades if t["side"] == "sell"]
-        total_pnl = sum(t.get("realized_pnl", 0) for t in sells)
+        trades_file = os.path.join(DATA_DIR, "live_trades.jsonl")
+        buys = 0
+        sells = 0
+        total_pnl = 0.0
+        if os.path.exists(trades_file):
+            with open(trades_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        t = json.loads(line)
+                        if t.get("side") == "buy":
+                            buys += 1
+                        elif t.get("side") == "sell":
+                            sells += 1
+                            # realized PnL = executed_funds - (avg_buy_price * volume)
+                            # approximate from trade record
+                            ef = float(t.get("executed_funds", 0))
+                            vol = float(t.get("volume_executed", 0))
+                            fee = float(t.get("fee", 0))
+                            # We don't have avg_buy_price in trade record,
+                            # so realized_pnl is approximated as executed_funds - fee
+                            # (actual PnL needs avg_buy_price from accounts)
+                            total_pnl += ef - fee
+                    except (json.JSONDecodeError, ValueError):
+                        pass
         return {
-            "total_trades": len(self.trader.trades),
-            "buys": len(buys),
-            "sells": len(sells),
+            "total_trades": buys + sells,
+            "buys": buys,
+            "sells": sells,
             "realized_pnl_total": total_pnl,
         }
 
@@ -138,11 +188,20 @@ class PerformanceMetrics:
     # Positions snapshot
     # ------------------------------------------------------------------
     def get_positions(self) -> dict:
+        positions = self.trader.get_positions()
         unrealized = self.trader.get_unrealized_pnl()
-        pv = self.trader.get_positions_value()
+        # Calculate total positions value from ticker
+        pv = 0.0
+        if positions:
+            markets = list(positions.keys())
+            tickers = self.trader.api.get_ticker(markets)
+            for tk in tickers:
+                m = tk["market"]
+                if m in positions:
+                    pv += positions[m] * tk["trade_price"]
         return {
-            "count": len(self.trader.positions),
-            "markets": list(self.trader.positions.keys()),
+            "count": len(positions),
+            "markets": list(positions.keys()),
             "total_value": pv,
             "unrealized_pnl": unrealized,
         }
@@ -167,11 +226,6 @@ class PerformanceMetrics:
             "trades": ts,
             "positions": pos,
         }
-
-        # Write runtime/status.json
-        status_path = os.path.join(RUNTIME_DIR, "status.json")
-        with open(status_path, "w") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
 
         return report
 

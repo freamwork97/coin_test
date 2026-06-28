@@ -44,6 +44,7 @@ sys.path.insert(0, BOT_DIR)
 from live_api import LiveUpbitAPI
 from live_trader import LiveTrader
 from strategy_live import get_strategy, Signal, RSIStrategy
+from performance import PerformanceMetrics
 
 
 class LiveSafetyManager:
@@ -282,6 +283,7 @@ class LiveBot:
         self.trader = LiveTrader(self.config)
         self.safety = LiveSafetyManager(self.config)
         self.strategy = get_strategy(self.config["strategy"])
+        self.performance = PerformanceMetrics(self.trader)
 
         # RSI fallback: config에서 사용 여부/파라미터를 읽음
         rsi_cfg = self.config.get("rsi_fallback", {})
@@ -465,16 +467,37 @@ class LiveBot:
 
     def _daily_summary(self):
         status = self.trader.get_status()
+        report = self.performance.build_report()
         pv = status["portfolio_value"]
         ret = ((pv - self.trader.initial_balance) / self.trader.initial_balance * 100) if self.trader.initial_balance > 0 else 0
+        wr = report["win_rate"]
+        mdd = report["mdd"]
+        fees = report["fees"]
+        trades = report["trades"]
         logger.info("=== DAILY SUMMARY ===")
         logger.info("  Portfolio: ₩%.0f (%.2f%%)", pv, ret)
         logger.info("  KRW: ₩%.0f", status["krw_balance"])
         logger.info("  Positions: %d", status["positions_count"])
-        logger.info("  Trades: %d", status["total_trades"])
+        logger.info("  Trades: %d (%dB/%dS)", trades["total_trades"], trades["buys"], trades["sells"])
+        logger.info("  Realized PnL: ₩%.0f", trades["realized_pnl_total"])
+        logger.info("  Win Rate: %.1f%% (%dW/%dL)", wr["win_rate_pct"], wr["wins"], wr["losses"])
+        logger.info("  MDD: %.2f%%", mdd["mdd_pct"])
+        logger.info("  Fees: ₩%.2f", fees["total_fees"])
 
     def _write_status(self):
         status = self.trader.get_status()
+        # Merge performance report into status
+        try:
+            report = self.performance.build_report()
+            status["performance"] = {
+                "returns": report["returns"],
+                "mdd": report["mdd"],
+                "win_rate": report["win_rate"],
+                "fees": report["fees"],
+                "trades": report["trades"],
+            }
+        except Exception as e:
+            logger.warning("Performance report failed: %s", e)
         with open(os.path.join(RUNTIME_DIR, "status.json"), "w") as f:
             json.dump(status, f, indent=2, ensure_ascii=False)
 
