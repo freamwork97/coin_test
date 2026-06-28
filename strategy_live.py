@@ -318,11 +318,12 @@ class TrendRiderStyleStrategy(BaseStrategy):
         if n < 50:
             return {}
 
-        opens   = [c["opening_price"] for c in candles]
-        highs   = [c["high_price"] for c in candles]
-        lows    = [c["low_price"] for c in candles]
-        closes  = [c["trade_price"] for c in candles]
-        volumes = [c["candle_acc_trade_volume"] for c in candles]
+        # Upbit API returns newest-first; reverse to chronological order
+        opens   = [c["opening_price"] for c in reversed(candles)]
+        highs   = [c["high_price"] for c in reversed(candles)]
+        lows    = [c["low_price"] for c in reversed(candles)]
+        closes  = [c["trade_price"] for c in reversed(candles)]
+        volumes = [c["candle_acc_trade_volume"] for c in reversed(candles)]
 
         ind = {"n": n, "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes}
 
@@ -759,7 +760,8 @@ class TrendRiderStyleStrategy(BaseStrategy):
                             candles_1d = api.get_day_candles(market, 100)
                             _time.sleep(self._candle_delay)
                             if len(candles_1d) >= 50:
-                                closes_1d = [c["trade_price"] for c in candles_1d]
+                                # Upbit API returns newest-first; reverse to chronological
+                                closes_1d = [c["trade_price"] for c in reversed(candles_1d)]
                                 ema_200_1d = _ema(closes_1d, 200)
                                 val = ema_200_1d[-1] if not (ema_200_1d[-1] != ema_200_1d[-1]) else 0
                                 row["ema_200_1d"] = val
@@ -877,8 +879,9 @@ class EnhancedMACrossoverStrategy(BaseStrategy):
                 if len(candles) < self.long_window + 2:
                     continue
 
-                prices = [c["trade_price"] for c in candles]
-                volumes = [c["candle_acc_trade_volume"] for c in candles]
+                # Upbit API returns newest-first; reverse to chronological
+                prices = [c["trade_price"] for c in reversed(candles)]
+                volumes = [c["candle_acc_trade_volume"] for c in reversed(candles)]
 
                 short_ma = self.ma(prices, self.short_window)
                 long_ma = self.ma(prices, self.long_window)
@@ -974,7 +977,8 @@ class RSIStrategy(BaseStrategy):
                 candles = self.get_candles(api, market, self.interval, self.period + 5)
                 if len(candles) < self.period:
                     continue
-                prices = [c["trade_price"] for c in candles]
+                # Upbit API returns newest-first; reverse to chronological
+                prices = [c["trade_price"] for c in reversed(candles)]
                 rsi_val = self.rsi(prices)
                 if rsi_val is None:
                     continue

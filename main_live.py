@@ -417,7 +417,8 @@ class LiveBot:
                 candles = self.api.get_candles(market, "60", 60)
                 if len(candles) < 30:
                     continue
-                prices = [c["trade_price"] for c in candles]
+                # Upbit API returns newest-first; reverse to chronological
+                prices = [c["trade_price"] for c in reversed(candles)]
                 ma10 = sum(prices[-10:]) / 10
                 ma30 = sum(prices[-30:]) / 30
                 ma50 = sum(prices[-50:]) / 50 if len(prices) >= 50 else ma30

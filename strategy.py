@@ -53,7 +53,8 @@ class MACrossoverStrategy(BaseStrategy):
                 candles = self.get_candles(api, market, self.interval, self.long_window + 5)
                 if len(candles) < self.long_window:
                     continue
-                prices = [c["trade_price"] for c in candles]
+                # Upbit API returns newest-first; reverse to chronological
+                prices = [c["trade_price"] for c in reversed(candles)]
 
                 short_ma = self.ma(prices, self.short_window)
                 long_ma = self.ma(prices, self.long_window)
@@ -118,7 +119,8 @@ class RSIStrategy(BaseStrategy):
                 candles = self.get_candles(api, market, self.interval, self.period + 5)
                 if len(candles) < self.period:
                     continue
-                prices = [c["trade_price"] for c in candles]
+                # Upbit API returns newest-first; reverse to chronological
+                prices = [c["trade_price"] for c in reversed(candles)]
                 rsi_val = self.rsi(prices)
                 if rsi_val is None:
                     continue
