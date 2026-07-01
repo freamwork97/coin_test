@@ -94,8 +94,9 @@ class LiveSafetyManager:
         self.btc_ma_slow = self.bear_market.get("btc_ma_slow", 200)
         self.btc_interval = self.bear_market.get("btc_interval", "60")
         self.regimes = self.bear_market.get("regimes", {})
-        self.regime_cache_ttl = self.bear_market.get("cache_ttl_seconds", 300)
-        self._regime_cache: tuple = (0, "bull")  # (timestamp, regime)
+        self.regime_cache_ttl = self.bear_market.get("cache_ttl_seconds", 60)
+        # (timestamp, regime, ema50, ema200) — MA values preserved for ticker-only fallback
+        self._regime_cache: tuple = (0, "bull", None, None)
         self._current_regime: str = "bull"
 
         # Market breadth detection (V6)
@@ -113,12 +114,13 @@ class LiveSafetyManager:
 
     def detect_market_regime(self, api) -> str:
         """Detect market regime using BTC MA50/MA200 on 1h candles.
-        Returns 'bull', 'neutral', or 'bear'. Cached for regime_cache_ttl seconds."""
+        Returns 'bull', 'neutral', or 'bear'. Cached for regime_cache_ttl seconds.
+        On API failure, falls back to BTC ticker vs last-known MA values."""
         if not self.bear_enabled:
             return "bull"
 
         now = time.time()
-        cache_ts, cached_regime = self._regime_cache
+        cache_ts, cached_regime, cached_ema50, cached_ema200 = self._regime_cache
         if now - cache_ts < self.regime_cache_ttl:
             return cached_regime
 
@@ -157,7 +159,7 @@ class LiveSafetyManager:
             else:
                 regime = "bear"
 
-            self._regime_cache = (now, regime)
+            self._regime_cache = (now, regime, ema50, ema200)
             if regime != self._current_regime:
                 logger.info(
                     "Market regime changed: %s → %s (BTC=₩%.0f, MA50=₩%.0f, MA200=₩%.0f)",
@@ -167,7 +169,30 @@ class LiveSafetyManager:
             return regime
 
         except Exception as e:
-            logger.warning("Market regime detection failed: %s", e)
+            logger.warning("Market regime detection failed (candles): %s", e)
+            # Fallback: use BTC ticker + last-known MA values
+            if cached_ema50 is not None and cached_ema200 is not None:
+                try:
+                    tickers = api.get_ticker(["KRW-BTC"])
+                    if tickers:
+                        btc_price = tickers[0]["trade_price"]
+                        if btc_price > cached_ema50 > cached_ema200:
+                            regime = "bull"
+                        elif btc_price > cached_ema200:
+                            regime = "neutral"
+                        else:
+                            regime = "bear"
+                        # Don't update MA cache — only refresh timestamp + regime
+                        self._regime_cache = (now, regime, cached_ema50, cached_ema200)
+                        if regime != self._current_regime:
+                            logger.info(
+                                "Market regime changed (ticker fallback): %s → %s (BTC=₩%.0f, MA50=₩%.0f, MA200=₩%.0f)",
+                                self._current_regime, regime, btc_price, cached_ema50, cached_ema200,
+                            )
+                        self._current_regime = regime
+                        return regime
+                except Exception as e2:
+                    logger.warning("Ticker fallback also failed: %s", e2)
             return self._current_regime
 
     def detect_market_breadth(self, api, markets: list) -> float:
