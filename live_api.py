@@ -159,10 +159,37 @@ class LiveUpbitAPI:
 
     def get_candles(self, market: str, interval: str = "60", count: int = 100) -> List[Dict]:
         endpoint = f"/candles/minutes/{interval}"
-        return self._request("GET", endpoint, {"market": market, "count": count}, auth=False, rate_limit_group="candle") or []
+        return self._get_candles_paged(endpoint, market, count)
 
     def get_day_candles(self, market: str, count: int = 100) -> List[Dict]:
-        return self._request("GET", "/candles/days", {"market": market, "count": count}, auth=False, rate_limit_group="candle") or []
+        return self._get_candles_paged("/candles/days", market, count)
+
+    def _get_candles_paged(self, endpoint: str, market: str, count: int) -> List[Dict]:
+        """Fetch candles, paginating with the `to` parameter when count > 200
+        (Upbit caps each request at 200 candles). Returns newest-first."""
+        if count <= 200:
+            return self._request("GET", endpoint, {"market": market, "count": count},
+                                 auth=False, rate_limit_group="candle") or []
+
+        results: List[Dict] = []
+        seen = set()
+        to = None
+        while len(results) < count:
+            params = {"market": market, "count": 200}
+            if to:
+                params["to"] = to
+            chunk = self._request("GET", endpoint, params, auth=False, rate_limit_group="candle") or []
+            new = [c for c in chunk if c.get("candle_date_time_utc") not in seen]
+            if not new:
+                break
+            for c in new:
+                seen.add(c.get("candle_date_time_utc"))
+            results.extend(new)
+            if len(chunk) < 200:
+                break  # no more history available
+            to = results[-1]["candle_date_time_utc"] + "Z"
+            time.sleep(0.06)
+        return results[:count]
 
     def get_orderbook(self, markets: List[str]) -> List[Dict]:
         market_str = ",".join(markets)

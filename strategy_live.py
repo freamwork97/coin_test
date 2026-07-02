@@ -527,6 +527,9 @@ class TrendRiderStyleStrategy(BaseStrategy):
             return "Ranging (High Vol)" if high_vol else "Ranging"
         elif is_bull and close > ema_200:
             return "Trending Bull"
+        elif close > ema_200:
+            # Above EMA200 but EMA50 not aligned — mixed, not a downtrend
+            return "Ranging (High Vol)" if high_vol else "Ranging"
         else:
             return "Trending Bear (High Vol)" if high_vol else "Trending Bear"
 
@@ -682,8 +685,9 @@ class TrendRiderStyleStrategy(BaseStrategy):
                 btc_indicators = btc_cached
             else:
                 try:
-                    btc_candles = self.get_candles(api, "KRW-BTC", self.interval, 60)
+                    btc_candles = self.get_candles(api, "KRW-BTC", self.interval, 61)
                     _time.sleep(self._candle_delay)
+                    btc_candles = btc_candles[1:]  # drop still-forming newest candle
                     if len(btc_candles) >= 50:
                         btc_ind = self._calc_indicators(btc_candles)
                         btc_row = self._get_row(btc_ind)
@@ -701,8 +705,12 @@ class TrendRiderStyleStrategy(BaseStrategy):
         for market in markets:
             try:
                 # --- 1h candles (main timeframe) ---
-                candles = self.get_candles(api, market, self.interval, 210)
+                # Fetch 211 and drop the still-forming newest candle so signals are
+                # evaluated on completed candles only (no intrabar flicker); 210
+                # completed candles keep EMA200 valid.
+                candles = self.get_candles(api, market, self.interval, 211)
                 _time.sleep(self._candle_delay)
+                candles = candles[1:]
                 if len(candles) < 100:
                     logger.debug("%s: insufficient 1h candles (%d)", market, len(candles))
                     continue
@@ -726,8 +734,9 @@ class TrendRiderStyleStrategy(BaseStrategy):
                         row["rsi_14_4h"] = cache_val.get("rsi_14_4h", 50)
                     else:
                         try:
-                            candles_4h = self.get_candles(api, market, "240", 100)
+                            candles_4h = self.get_candles(api, market, "240", 101)
                             _time.sleep(self._candle_delay)
+                            candles_4h = candles_4h[1:]  # drop still-forming candle
                             if len(candles_4h) >= 50:
                                 ind_4h = self._calc_indicators(candles_4h)
                                 row_4h = self._get_row(ind_4h)
@@ -757,8 +766,11 @@ class TrendRiderStyleStrategy(BaseStrategy):
                         row["ema_200_1d"] = cache_val
                     else:
                         try:
-                            candles_1d = api.get_day_candles(market, 100)
+                            # 221 so EMA200(1d) is actually computable (was 100 → always NaN,
+                            # which silently disabled the daily macro filter)
+                            candles_1d = api.get_day_candles(market, 221)
                             _time.sleep(self._candle_delay)
+                            candles_1d = candles_1d[1:]  # drop today's forming candle
                             if len(candles_1d) >= 50:
                                 # Upbit API returns newest-first; reverse to chronological
                                 closes_1d = [c["trade_price"] for c in reversed(candles_1d)]
@@ -874,8 +886,9 @@ class EnhancedMACrossoverStrategy(BaseStrategy):
         signals = []
         for market in markets:
             try:
-                max_window = max(self.long_window, self.trend_ma_window) + 10
+                max_window = max(self.long_window, self.trend_ma_window) + 11
                 candles = self.get_candles(api, market, self.interval, max_window)
+                candles = candles[1:]  # drop still-forming candle
                 if len(candles) < self.long_window + 2:
                     continue
 
@@ -974,7 +987,8 @@ class RSIStrategy(BaseStrategy):
         signals = []
         for market in markets:
             try:
-                candles = self.get_candles(api, market, self.interval, self.period + 5)
+                candles = self.get_candles(api, market, self.interval, self.period + 6)
+                candles = candles[1:]  # drop still-forming candle
                 if len(candles) < self.period:
                     continue
                 # Upbit API returns newest-first; reverse to chronological
@@ -1082,7 +1096,8 @@ class MeanReversionStrategy(BaseStrategy):
         # Get BTC RSI for filter
         btc_rsi = 50
         try:
-            btc_candles = self.get_candles(api, "KRW-BTC", self.interval, self.rsi_period + 5)
+            btc_candles = self.get_candles(api, "KRW-BTC", self.interval, self.rsi_period + 6)
+            btc_candles = btc_candles[1:]  # drop still-forming candle
             if len(btc_candles) >= self.rsi_period:
                 btc_prices = [c["trade_price"] for c in reversed(btc_candles)]
                 btc_rsi = _rsi(btc_prices, self.rsi_period)[-1]
@@ -1098,7 +1113,8 @@ class MeanReversionStrategy(BaseStrategy):
 
         for market in markets:
             try:
-                candles = self.get_candles(api, market, self.interval, max(self.bb_period, self.rsi_period) + 10)
+                candles = self.get_candles(api, market, self.interval, max(self.bb_period, self.rsi_period) + 11)
+                candles = candles[1:]  # drop still-forming candle
                 if len(candles) < self.bb_period:
                     continue
 
