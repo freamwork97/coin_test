@@ -16,32 +16,32 @@
     "max_mdd_rate": -0.05,
     "max_single_coin_weight": 0.25,
     "max_positions": 7,
-    "cooldown_cycles": 5,
+    "cooldown_cycles": 60,
     "emergency_stop": false,
     "forced_sell": {
-      "stop_loss_pct": -6.0,
+      "stop_loss_pct": -4.0,
       "take_profit_pct": 10.0,
-      "max_hold_hours": 72
+      "max_hold_hours": 48
     },
     "cascading_cut": {
       "enabled": true,
       "thresholds": [
-        [2, -1.5],
-        [4, 0.0],
-        [8, 0.5],
-        [16, 1.0]
+        [3, -2.0],
+        [6, -1.0],
+        [12, 0.0],
+        [24, 0.5]
       ]
     },
     "trailing_stop": {
       "enabled": true,
-      "activation_pct": 5.0,
-      "distance_pct": 3.0
+      "activation_pct": 4.0,
+      "distance_pct": 2.5
     },
     "bear_market": {
       "enabled": true,
       "btc_ma_fast": 50,
       "btc_ma_slow": 200,
-      "btc_interval": "60",
+      "btc_interval": "day",
       "regimes": {
         "bull": {
           "max_positions": 7,
@@ -59,7 +59,7 @@
           "min_confidence": 7
         }
       },
-      "cache_ttl_seconds": 60
+      "cache_ttl_seconds": 300
     },
     "market_breadth": {
       "enabled": true,
@@ -85,7 +85,7 @@
       "volume_factor": 0.7,
       "rsi_exit": 78,
       "min_confidence_bull": 5,
-      "min_confidence_bear": 5,
+      "min_confidence_bear": 6,
       "use_4h": true,
       "use_1d": true,
       "use_btc_sentiment": true,
@@ -97,7 +97,7 @@
     "params": {
       "period": 14,
       "overbought": 70,
-      "oversold": 30,
+      "oversold": 25,
       "interval": "60"
     }
   },
@@ -112,8 +112,8 @@
       "bb_position_max": 0.15,
       "volume_ratio_min": 1.0,
       "take_profit_pct": 3.0,
-      "stop_loss_pct": -4.0,
-      "max_hold_hours": 8,
+      "stop_loss_pct": -2.5,
+      "max_hold_hours": 12,
       "position_size_pct": 0.03,
       "max_positions": 2,
       "btc_rsi_min": 30,

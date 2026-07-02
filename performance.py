@@ -77,7 +77,7 @@ class PerformanceMetrics:
         return {"mdd": max_dd, "mdd_pct": max_dd * 100, "peak": dd_peak, "trough": dd_trough}
 
     def _load_equity_curve(self) -> List[float]:
-        eq_file = os.path.join(DATA_DIR, "equity_curve.csv")
+        eq_file = os.path.join(DATA_DIR, "live_equity_curve.csv")
         if not os.path.exists(eq_file):
             return []
         vals = []
@@ -96,7 +96,7 @@ class PerformanceMetrics:
     # Win rate from trades.jsonl
     # ------------------------------------------------------------------
     def get_win_rate(self) -> dict:
-        trades_file = os.path.join(DATA_DIR, "trades.jsonl")
+        trades_file = os.path.join(DATA_DIR, "live_trades.jsonl")
         if not os.path.exists(trades_file):
             return {"win_rate_pct": 0.0, "wins": 0, "losses": 0, "total_closed": 0}
 
@@ -106,15 +106,18 @@ class PerformanceMetrics:
                 line = line.strip()
                 if not line:
                     continue
-                t = json.loads(line)
-                if t.get("side") == "sell":
+                try:
+                    t = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if t.get("side") == "sell" and t.get("realized_pnl") is not None:
                     sells.append(t)
 
         if not sells:
             return {"win_rate_pct": 0.0, "wins": 0, "losses": 0, "total_closed": 0}
 
-        wins = sum(1 for t in sells if t.get("realized_pnl", 0) > 0)
-        losses = sum(1 for t in sells if t.get("realized_pnl", 0) < 0)
+        wins = sum(1 for t in sells if t["realized_pnl"] > 0)
+        losses = sum(1 for t in sells if t["realized_pnl"] < 0)
         total = wins + losses
         wr = (wins / total * 100) if total > 0 else 0.0
 
@@ -166,15 +169,8 @@ class PerformanceMetrics:
                             buys += 1
                         elif t.get("side") == "sell":
                             sells += 1
-                            # realized PnL = executed_funds - (avg_buy_price * volume)
-                            # approximate from trade record
-                            ef = float(t.get("executed_funds", 0))
-                            vol = float(t.get("volume_executed", 0))
-                            fee = float(t.get("fee", 0))
-                            # We don't have avg_buy_price in trade record,
-                            # so realized_pnl is approximated as executed_funds - fee
-                            # (actual PnL needs avg_buy_price from accounts)
-                            total_pnl += ef - fee
+                            if t.get("realized_pnl") is not None:
+                                total_pnl += float(t["realized_pnl"])
                     except (json.JSONDecodeError, ValueError):
                         pass
         return {

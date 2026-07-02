@@ -92,12 +92,18 @@ class LiveSafetyManager:
         self.bear_enabled = self.bear_market.get("enabled", True)
         self.btc_ma_fast = self.bear_market.get("btc_ma_fast", 50)
         self.btc_ma_slow = self.bear_market.get("btc_ma_slow", 200)
-        self.btc_interval = self.bear_market.get("btc_interval", "60")
+        self.btc_interval = self.bear_market.get("btc_interval", "day")
         self.regimes = self.bear_market.get("regimes", {})
-        self.regime_cache_ttl = self.bear_market.get("cache_ttl_seconds", 60)
+        self.regime_cache_ttl = self.bear_market.get("cache_ttl_seconds", 300)
         # (timestamp, regime, ema50, ema200) — MA values preserved for ticker-only fallback
         self._regime_cache: tuple = (0, "bull", None, None)
         self._current_regime: str = "bull"
+
+        # Per-position strategy tag + custom exit params (persisted across restarts)
+        self.position_strategy: Dict[str, str] = {}
+        self.position_custom_exit: Dict[str, dict] = {}
+        self._meta_file = os.path.join(RUNTIME_DIR, "positions_meta.json")
+        self._load_position_meta()
 
         # Market breadth detection (V6)
         self.market_breadth = s.get("market_breadth", {})
@@ -112,8 +118,71 @@ class LiveSafetyManager:
     def advance_cycle(self):
         self.cycle_count += 1
 
+    # ------------------------------------------------------------------
+    # Position metadata persistence (restart-safe trailing/cascade/max-hold)
+    # ------------------------------------------------------------------
+    def _load_position_meta(self):
+        try:
+            with open(self._meta_file) as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.warning("Failed to load position metadata: %s", e)
+            return
+        for market, m in meta.items():
+            try:
+                self.position_entry_time[market] = datetime.fromisoformat(m["entry_time"])
+            except Exception:
+                self.position_entry_time[market] = datetime.now()
+            self.position_entry_price[market] = m.get("entry_price", 0.0)
+            self.position_peak_price[market] = m.get("peak_price", m.get("entry_price", 0.0))
+            self.position_strategy[market] = m.get("strategy", "unknown")
+            if m.get("custom_exit"):
+                self.position_custom_exit[market] = m["custom_exit"]
+        if meta:
+            logger.info("Restored position metadata: %s", list(meta.keys()))
+
+    def _save_position_meta(self):
+        meta = {}
+        for market, ts in self.position_entry_time.items():
+            meta[market] = {
+                "entry_time": ts.isoformat(),
+                "entry_price": self.position_entry_price.get(market, 0.0),
+                "peak_price": self.position_peak_price.get(market, 0.0),
+                "strategy": self.position_strategy.get(market, "unknown"),
+                "custom_exit": self.position_custom_exit.get(market),
+            }
+        try:
+            with open(self._meta_file, "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save position metadata: %s", e)
+
+    def sync_positions(self, trader: LiveTrader):
+        """Reconcile tracked metadata with actual exchange positions.
+        Adopts untracked positions (restart / manual buys) and drops stale entries."""
+        positions = trader.get_positions()
+        changed = False
+        for market in positions:
+            if market not in self.position_entry_time:
+                avg = trader.api.get_average_buy_price(market) or 0.0
+                self.position_entry_time[market] = datetime.now()
+                self.position_entry_price[market] = avg
+                self.position_peak_price[market] = avg
+                self.position_strategy[market] = "unknown"
+                logger.info("Adopted untracked position %s (avg_buy=₩%.2f)", market, avg)
+                changed = True
+        for market in list(self.position_entry_time.keys()):
+            if market not in positions:
+                logger.info("Position %s no longer on exchange — dropping metadata", market)
+                self.on_sell(market)
+                changed = False  # on_sell already saved
+        if changed:
+            self._save_position_meta()
+
     def detect_market_regime(self, api) -> str:
-        """Detect market regime using BTC MA50/MA200 on 1h candles.
+        """Detect market regime using BTC MA50/MA200 on DAILY candles.
         Returns 'bull', 'neutral', or 'bear'. Cached for regime_cache_ttl seconds.
         On API failure, falls back to BTC ticker vs last-known MA values."""
         if not self.bear_enabled:
@@ -125,13 +194,18 @@ class LiveSafetyManager:
             return cached_regime
 
         try:
-            candles = api.get_candles("KRW-BTC", self.btc_interval, max(self.btc_ma_slow + 10, 210))
-            if len(candles) < self.btc_ma_slow:
-                logger.warning("BTC candles insufficient for regime detection (%d < %d)", len(candles), self.btc_ma_slow)
+            if self.btc_interval == "day":
+                candles = api.get_day_candles("KRW-BTC", max(self.btc_ma_slow + 20, 220))
+            else:
+                candles = api.get_candles("KRW-BTC", self.btc_interval, max(self.btc_ma_slow + 10, 210))
+            if len(candles) < self.btc_ma_slow + 1:
+                logger.warning("BTC candles insufficient for regime detection (%d < %d)", len(candles), self.btc_ma_slow + 1)
                 return self._current_regime
 
-            prices = [c["trade_price"] for c in candles]
-            # Upbit API returns newest-first; reverse to chronological order
+            # Upbit API returns newest-first; candles[0] is the still-forming candle.
+            # Use it only as the current price; compute MAs on completed candles.
+            live_price = candles[0]["trade_price"]
+            prices = [c["trade_price"] for c in candles[1:]]
             prices.reverse()
 
             # Calculate EMAs
@@ -146,7 +220,7 @@ class LiveSafetyManager:
 
             ema50 = _ema(prices, self.btc_ma_fast)
             ema200 = _ema(prices, self.btc_ma_slow)
-            current_price = prices[-1]
+            current_price = live_price
 
             if ema50 is None or ema200 is None:
                 return self._current_regime
@@ -211,10 +285,11 @@ class LiveSafetyManager:
             total = 0
             for market in markets:
                 try:
-                    candles = api.get_candles(market, self.breadth_interval, self.breadth_ema_period + 5)
+                    candles = api.get_candles(market, self.breadth_interval, self.breadth_ema_period + 6)
+                    # Drop the still-forming newest candle; reverse to chronological
+                    candles = candles[1:]
                     if len(candles) < self.breadth_ema_period:
                         continue
-                    # Upbit API returns newest-first; reverse to chronological
                     prices = [c["trade_price"] for c in reversed(candles)]
 
                     # Calculate EMA
@@ -349,11 +424,19 @@ class LiveSafetyManager:
         self.position_entry_time.pop(market, None)
         self.position_entry_price.pop(market, None)
         self.position_peak_price.pop(market, None)
+        self.position_strategy.pop(market, None)
+        self.position_custom_exit.pop(market, None)
+        self._save_position_meta()
 
-    def on_buy(self, market: str, entry_price: float):
+    def on_buy(self, market: str, entry_price: float, strategy: str = "trendrider",
+               custom_exit: Optional[dict] = None):
         self.position_entry_time[market] = datetime.now()
         self.position_entry_price[market] = entry_price
         self.position_peak_price[market] = entry_price
+        self.position_strategy[market] = strategy
+        if custom_exit:
+            self.position_custom_exit[market] = custom_exit
+        self._save_position_meta()
 
     def update_peak(self, market: str, current_price: float):
         """Update peak price for trailing stop tracking."""
@@ -425,13 +508,19 @@ class LiveSafetyManager:
         # Update peak for trailing stop
         self.update_peak(market, current_price)
 
+        # Per-strategy exit overrides (e.g. mean-reversion scalps use tighter TP/SL)
+        ce = self.position_custom_exit.get(market) or {}
+        stop_loss_pct = ce.get("stop_loss_pct", self.stop_loss_pct)
+        take_profit_pct = ce.get("take_profit_pct", self.take_profit_pct)
+        max_hold_hours = ce.get("max_hold_hours", self.max_hold_hours)
+
         # Stop-loss (hard floor)
-        if pnl_pct <= self.stop_loss_pct:
-            return f"Stop-loss triggered ({pnl_pct:.1f}% <= {self.stop_loss_pct:.1f}%)"
+        if pnl_pct <= stop_loss_pct:
+            return f"Stop-loss triggered ({pnl_pct:.1f}% <= {stop_loss_pct:.1f}%)"
 
         # Take-profit
-        if pnl_pct >= self.take_profit_pct:
-            return f"Take-profit triggered ({pnl_pct:.1f}% >= {self.take_profit_pct:.1f}%)"
+        if pnl_pct >= take_profit_pct:
+            return f"Take-profit triggered ({pnl_pct:.1f}% >= {take_profit_pct:.1f}%)"
 
         # Cascading early loss cut (V4) — checked before max hold
         cascade_reason = self.check_cascading_cut(market, current_price, avg_price)
@@ -447,8 +536,8 @@ class LiveSafetyManager:
         if market in self.position_entry_time:
             held_seconds = time.time() - self.position_entry_time[market].timestamp()
             held_hours = held_seconds / 3600
-            if held_hours >= self.max_hold_hours:
-                return f"Max hold time exceeded ({held_hours:.1f}h >= {self.max_hold_hours}h)"
+            if held_hours >= max_hold_hours:
+                return f"Max hold time exceeded ({held_hours:.1f}h >= {max_hold_hours}h)"
 
         return None
 
@@ -578,14 +667,15 @@ class LiveBot:
                 if cycle_num % 10 == 1:
                     self.safety.detect_market_breadth(self.api, self.markets)
 
-                # 1. Safety check
+                # 1. Safety check — violations block BUYS only; exits/sells must
+                #    keep running so losing positions aren't trapped.
                 safety_result = self.safety.check(self.trader)
+                buys_halted = not safety_result["can_trade"]
+                if buys_halted:
+                    logger.warning("Buys halted: %s (exits still active)", safety_result["violations"])
 
-                if not safety_result["can_trade"]:
-                    logger.warning("Trading halted: %s", safety_result["violations"])
-                    self._write_status()
-                    time.sleep(self.cycle_seconds)
-                    continue
+                # 1.2 Reconcile position metadata with exchange (restart-safe)
+                self.safety.sync_positions(self.trader)
 
                 # 1.5 Forced-sell check: stop-loss / take-profit / max hold time
                 positions = self.trader.get_positions()
@@ -600,9 +690,13 @@ class LiveBot:
                         logger.warning("FORCED SELL %s — %s", market, reason)
                         self.trader.sell(market)
                         self.safety.on_sell(market)
+                # Persist updated peak prices for trailing stops
+                self.safety._save_position_meta()
 
                 # 2. Generate signals (primary: TrendRider)
                 signals = self.strategy.generate_signals(self.api, self.markets)
+                for sig in signals:
+                    sig.params.setdefault("strategy", "trendrider")
 
                 # 2a. Mean reversion (V7): neutral/bear regime에서 TrendRider 신호 없을 때
                 if not signals and self.mr_strategy and self.safety._current_regime in self.mr_regimes:
@@ -610,14 +704,21 @@ class LiveBot:
                         mr_signals = self.mr_strategy.generate_signals(self.api, self.markets)
                         if mr_signals:
                             logger.info("Mean reversion generated %d signal(s) (regime=%s)", len(mr_signals), self.safety._current_regime)
+                            for sig in mr_signals:
+                                sig.params["strategy"] = "mean_reversion"
                             signals.extend(mr_signals)
                     except Exception as e:
                         logger.error("Mean reversion error: %s", e)
 
                 # 2b. RSI fallback: 여전히 신호 없으면 RSI도 확인
+                #     (bear regime에서는 falling-knife 매수 방지를 위해 sell 신호만 허용)
                 if not signals and self.rsi_strategy:
                     try:
                         rsi_signals = self.rsi_strategy.generate_signals(self.api, self.markets)
+                        for sig in rsi_signals:
+                            sig.params["strategy"] = "rsi_fallback"
+                        if self.safety._current_regime == "bear":
+                            rsi_signals = [s for s in rsi_signals if s.side == "sell"]
                         if rsi_signals:
                             logger.info("RSI fallback generated %d signal(s)", len(rsi_signals))
                             signals.extend(rsi_signals)
@@ -651,37 +752,77 @@ class LiveBot:
                 for sig in signals:
                     if sig.market in acted_this_cycle:
                         continue
+                    sig_strategy = sig.params.get("strategy", "trendrider")
 
                     if sig.side == "buy":
-                        if self.safety.can_buy(sig.market, self.trader):
-                            # Calculate position size based on current KRW (regime-aware)
-                            krw = self.trader.get_krw_balance()
-                            _, effective_size, effective_min_conf = self.safety._get_effective_limits()
-                            amount = krw * effective_size
+                        if buys_halted:
+                            continue
+                        if not self.safety.can_buy(sig.market, self.trader):
+                            continue
 
-                            # Regime-aware confidence filter
-                            if sig.confidence * 100 < effective_min_conf:
-                                logger.info("Signal BUY %s rejected — confidence %.1f%% < %d (regime=%s)",
-                                            sig.market, sig.confidence * 100, effective_min_conf, self.safety._current_regime)
+                        _, effective_size, effective_min_conf = self.safety._get_effective_limits()
+
+                        # Regime-aware confidence filter — compares the strategy's
+                        # 0-10 confidence_score against the regime minimum.
+                        conf_score = sig.params.get("confidence_score")
+                        if conf_score is not None and conf_score < effective_min_conf:
+                            logger.info("Signal BUY %s rejected — score %d/10 < %d (regime=%s)",
+                                        sig.market, conf_score, effective_min_conf, self.safety._current_regime)
+                            continue
+
+                        # Strategy-specific sizing + exit rules
+                        custom_exit = None
+                        size_pct = effective_size
+                        if sig_strategy == "mean_reversion" and self.mr_strategy:
+                            mr_open = sum(1 for s in self.safety.position_strategy.values()
+                                          if s == "mean_reversion")
+                            if mr_open >= self.mr_strategy.max_positions:
+                                logger.info("Signal BUY %s rejected — MR positions full (%d)",
+                                            sig.market, mr_open)
                                 continue
-                            if amount >= 5000:
-                                logger.info("Signal: BUY %s (%.1f%% conf) — %s", sig.market, sig.confidence * 100, sig.reason)
-                                result = self.trader.buy(sig.market, amount)
-                                if result:
-                                    # Get entry price from ticker
-                                    tickers = self.api.get_ticker([sig.market])
-                                    entry_price = tickers[0]["trade_price"] if tickers else 0
-                                    self.safety.on_buy(sig.market, entry_price)
-                                acted_this_cycle.add(sig.market)
-                            else:
-                                logger.info("Signal BUY %s but amount too small (₩%.0f)", sig.market, amount)
+                            size_pct = self.mr_strategy.position_size_pct
+                            custom_exit = {
+                                "take_profit_pct": self.mr_strategy.take_profit_pct,
+                                "stop_loss_pct": self.mr_strategy.stop_loss_pct,
+                                "max_hold_hours": self.mr_strategy.max_hold_hours,
+                            }
+
+                        # Size on portfolio value (not just remaining cash), capped by cash
+                        krw = self.trader.get_krw_balance()
+                        pv = safety_result.get("portfolio_value", krw)
+                        amount = min(pv * size_pct, krw * 0.98)
+
+                        if amount >= 5000:
+                            logger.info("Signal: BUY %s (%.1f%% conf, %s) — %s",
+                                        sig.market, sig.confidence * 100, sig_strategy, sig.reason)
+                            result = self.trader.buy(sig.market, amount)
+                            if result:
+                                # Get entry price from ticker (fallback: exchange avg buy price)
+                                tickers = self.api.get_ticker([sig.market])
+                                entry_price = tickers[0]["trade_price"] if tickers else \
+                                    (self.api.get_average_buy_price(sig.market) or 0)
+                                self.safety.on_buy(sig.market, entry_price,
+                                                   strategy=sig_strategy, custom_exit=custom_exit)
+                            acted_this_cycle.add(sig.market)
+                        else:
+                            logger.info("Signal BUY %s but amount too small (₩%.0f)", sig.market, amount)
 
                     elif sig.side == "sell":
-                        if sig.market in positions:
-                            logger.info("Signal: SELL %s (%.1f%% conf) — %s", sig.market, sig.confidence * 100, sig.reason)
-                            self.trader.sell(sig.market)
-                            self.safety.on_sell(sig.market)
-                            acted_this_cycle.add(sig.market)
+                        if sig.market not in positions:
+                            continue
+                        # Exit scoping: a strategy may only close its own positions.
+                        # Unknown (adopted) positions are managed by the primary strategy.
+                        pos_strategy = self.safety.position_strategy.get(sig.market, "unknown")
+                        if not (pos_strategy == sig_strategy or
+                                (pos_strategy == "unknown" and sig_strategy == "trendrider")):
+                            logger.debug("SELL %s from %s skipped — position owned by %s",
+                                         sig.market, sig_strategy, pos_strategy)
+                            continue
+                        logger.info("Signal: SELL %s (%.1f%% conf, %s) — %s",
+                                    sig.market, sig.confidence * 100, sig_strategy, sig.reason)
+                        self.trader.sell(sig.market)
+                        self.safety.on_sell(sig.market)
+                        acted_this_cycle.add(sig.market)
 
                 # 4. Status
                 self._write_status()

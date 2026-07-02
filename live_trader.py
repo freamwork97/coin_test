@@ -23,6 +23,7 @@ DATA_DIR = os.path.join(BOT_DIR, "data")
 RUNTIME_DIR = os.path.join(BOT_DIR, "runtime")
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.jsonl")
 EQUITY_FILE = os.path.join(DATA_DIR, "live_equity_curve.csv")
+DAILY_PNL_FILE = os.path.join(RUNTIME_DIR, "daily_pnl.json")
 
 
 class LiveTrader:
@@ -44,15 +45,34 @@ class LiveTrader:
 
         os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(RUNTIME_DIR, exist_ok=True)
+        self._load_daily_pnl()
         self._init_balance()
 
     def _init_balance(self):
-        """Record initial balance from exchange."""
-        krw = self.api.get_krw_balance()
+        """Record initial balance from exchange.
+        Uses full portfolio value (KRW + coins) so restarting while invested
+        doesn't distort return/daily-loss calculations."""
+        pv = self.get_portfolio_value()
         if self.initial_balance == 0:
-            self.initial_balance = krw
-        self.peak_value = krw
-        logger.info("LiveTrader initialized: KRW balance=₩%.0f", krw)
+            self.initial_balance = pv
+        self.peak_value = pv
+        logger.info("LiveTrader initialized: portfolio value=₩%.0f", pv)
+
+    def _load_daily_pnl(self):
+        try:
+            with open(DAILY_PNL_FILE) as f:
+                self.daily_pnl = json.load(f)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("Failed to load daily pnl: %s", e)
+
+    def _save_daily_pnl(self):
+        try:
+            with open(DAILY_PNL_FILE, "w") as f:
+                json.dump(self.daily_pnl, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save daily pnl: %s", e)
 
     def get_krw_balance(self) -> float:
         return self.api.get_krw_balance()
@@ -142,6 +162,9 @@ class LiveTrader:
             logger.warning("Volume exceeds position: %.6f > %.6f", volume, positions[market])
             volume = positions[market]
 
+        # Capture avg buy price BEFORE the sell (account entry disappears after)
+        avg_buy_price = self.api.get_average_buy_price(market)
+
         order = self.api.market_sell(market, volume)
         if not order:
             logger.error("Market sell failed for %s", market)
@@ -161,6 +184,17 @@ class LiveTrader:
                 paid_fee = str(detail.get("paid_fee", "0") or "0")
                 executed_funds = str(detail.get("executed_funds", "0") or "0")
 
+        # Realized PnL = proceeds - fee - cost basis
+        realized_pnl = None
+        try:
+            vol_exec = float(executed_volume)
+            funds = float(executed_funds)
+            fee = float(paid_fee)
+            if avg_buy_price and vol_exec > 0 and funds > 0:
+                realized_pnl = funds - fee - vol_exec * avg_buy_price
+        except (TypeError, ValueError):
+            pass
+
         trade = {
             "uuid": uuid,
             "market": market,
@@ -169,13 +203,25 @@ class LiveTrader:
             "volume_executed": executed_volume,
             "executed_funds": executed_funds,
             "fee": paid_fee,
+            "avg_buy_price": avg_buy_price,
+            "realized_pnl": realized_pnl,
             "timestamp": order.get("created_at") or datetime.now().isoformat(),
         }
         self._record_trade(trade)
 
-        # Track consecutive losses (approximate — check PnL later)
-        # We'll refine based on order result
-        logger.info("SELL %s  vol=%.6f  order=%s", market, volume, trade["uuid"])
+        # Update daily PnL (drives the daily-loss circuit breaker) + loss streak
+        if realized_pnl is not None:
+            today = datetime.now().strftime("%Y-%m-%d")
+            self.daily_pnl[today] = self.daily_pnl.get(today, 0.0) + realized_pnl
+            self._save_daily_pnl()
+            if realized_pnl < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+            logger.info("SELL %s  vol=%.6f  realized_pnl=₩%+.0f  order=%s",
+                        market, volume, realized_pnl, trade["uuid"])
+        else:
+            logger.info("SELL %s  vol=%.6f  order=%s", market, volume, trade["uuid"])
         return trade
 
     def _record_trade(self, trade: Dict):
