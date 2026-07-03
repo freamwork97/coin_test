@@ -90,14 +90,16 @@ class LiveSafetyManager:
         # Bear market regime detection (V5)
         self.bear_market = s.get("bear_market", {})
         self.bear_enabled = self.bear_market.get("enabled", True)
+        self.btc_ma_short = self.bear_market.get("btc_ma_short", 20)
         self.btc_ma_fast = self.bear_market.get("btc_ma_fast", 50)
         self.btc_ma_slow = self.bear_market.get("btc_ma_slow", 200)
         self.btc_interval = self.bear_market.get("btc_interval", "day")
         self.regimes = self.bear_market.get("regimes", {})
         self.regime_cache_ttl = self.bear_market.get("cache_ttl_seconds", 300)
-        # (timestamp, regime, ema50, ema200) — MA values preserved for ticker-only fallback
-        self._regime_cache: tuple = (0, "bull", None, None)
+        # (timestamp, regime, (ema20, ema50, ema200)) — EMAs preserved for ticker-only fallback
+        self._regime_cache: tuple = (0, "bull", None)
         self._current_regime: str = "bull"
+        self._regime_score: int = 4
 
         # Per-position strategy tag + custom exit params (persisted across restarts)
         self.position_strategy: Dict[str, str] = {}
@@ -181,15 +183,45 @@ class LiveSafetyManager:
         if changed:
             self._save_position_meta()
 
+    @staticmethod
+    def _classify_regime(price: float, ema_short: float, ema_fast: float, ema_slow: float):
+        """4-point trend score on BTC daily EMAs → (regime, score).
+
+        Macro legs (price vs EMA200, EMA50 vs EMA200) alone react too slowly:
+        a multi-week -15% correction can stay 'bull' until EMA200 finally breaks.
+        Adding short-term legs (price vs EMA20, EMA20 vs EMA50) downgrades the
+        regime step-by-step as a decline deepens, and upgrades it gradually
+        during recovery.
+
+        bull requires score >= 3 AND price above EMA20 — once price loses the
+        20-day line the regime is at best neutral, regardless of macro structure.
+          score >= 3 (+ price > EMA20) → bull, 2-3 → neutral, 1-0 → bear
+        """
+        score = 0
+        if price > ema_slow:
+            score += 1
+        if ema_fast > ema_slow:
+            score += 1
+        if price > ema_short:
+            score += 1
+        if ema_short > ema_fast:
+            score += 1
+
+        if score >= 3 and price > ema_short:
+            return "bull", score
+        if score >= 2:
+            return "neutral", score
+        return "bear", score
+
     def detect_market_regime(self, api) -> str:
-        """Detect market regime using BTC MA50/MA200 on DAILY candles.
+        """Detect market regime using BTC EMA20/EMA50/EMA200 on DAILY candles.
         Returns 'bull', 'neutral', or 'bear'. Cached for regime_cache_ttl seconds.
-        On API failure, falls back to BTC ticker vs last-known MA values."""
+        On API failure, falls back to BTC ticker vs last-known EMA values."""
         if not self.bear_enabled:
             return "bull"
 
         now = time.time()
-        cache_ts, cached_regime, cached_ema50, cached_ema200 = self._regime_cache
+        cache_ts, cached_regime, cached_emas = self._regime_cache
         if now - cache_ts < self.regime_cache_ttl:
             return cached_regime
 
@@ -218,50 +250,43 @@ class LiveSafetyManager:
                     ema = (data[i] - ema) * multiplier + ema
                 return ema
 
+            ema20 = _ema(prices, self.btc_ma_short)
             ema50 = _ema(prices, self.btc_ma_fast)
             ema200 = _ema(prices, self.btc_ma_slow)
             current_price = live_price
 
-            if ema50 is None or ema200 is None:
+            if ema20 is None or ema50 is None or ema200 is None:
                 return self._current_regime
 
-            # Regime logic: Bull > Neutral > Bear
-            if current_price > ema50 > ema200:
-                regime = "bull"
-            elif current_price > ema200:
-                regime = "neutral"
-            else:
-                regime = "bear"
+            regime, score = self._classify_regime(current_price, ema20, ema50, ema200)
 
-            self._regime_cache = (now, regime, ema50, ema200)
+            self._regime_cache = (now, regime, (ema20, ema50, ema200))
+            self._regime_score = score
             if regime != self._current_regime:
                 logger.info(
-                    "Market regime changed: %s → %s (BTC=₩%.0f, MA50=₩%.0f, MA200=₩%.0f)",
-                    self._current_regime, regime, current_price, ema50, ema200,
+                    "Market regime changed: %s → %s (score %d/4, BTC=₩%.0f, EMA%d=₩%.0f, EMA%d=₩%.0f, EMA%d=₩%.0f)",
+                    self._current_regime, regime, score, current_price,
+                    self.btc_ma_short, ema20, self.btc_ma_fast, ema50, self.btc_ma_slow, ema200,
                 )
             self._current_regime = regime
             return regime
 
         except Exception as e:
             logger.warning("Market regime detection failed (candles): %s", e)
-            # Fallback: use BTC ticker + last-known MA values
-            if cached_ema50 is not None and cached_ema200 is not None:
+            # Fallback: use BTC ticker + last-known EMA values
+            if cached_emas is not None:
                 try:
                     tickers = api.get_ticker(["KRW-BTC"])
                     if tickers:
                         btc_price = tickers[0]["trade_price"]
-                        if btc_price > cached_ema50 > cached_ema200:
-                            regime = "bull"
-                        elif btc_price > cached_ema200:
-                            regime = "neutral"
-                        else:
-                            regime = "bear"
-                        # Don't update MA cache — only refresh timestamp + regime
-                        self._regime_cache = (now, regime, cached_ema50, cached_ema200)
+                        regime, score = self._classify_regime(btc_price, *cached_emas)
+                        # Don't update EMA cache — only refresh timestamp + regime
+                        self._regime_cache = (now, regime, cached_emas)
+                        self._regime_score = score
                         if regime != self._current_regime:
                             logger.info(
-                                "Market regime changed (ticker fallback): %s → %s (BTC=₩%.0f, MA50=₩%.0f, MA200=₩%.0f)",
-                                self._current_regime, regime, btc_price, cached_ema50, cached_ema200,
+                                "Market regime changed (ticker fallback): %s → %s (score %d/4, BTC=₩%.0f)",
+                                self._current_regime, regime, score, btc_price,
                             )
                         self._current_regime = regime
                         return regime
@@ -662,6 +687,11 @@ class LiveBot:
 
                 # 0. Market regime detection (V5)
                 self.safety.detect_market_regime(self.api)
+                # Periodic heartbeat so the operator can see the current judgment
+                if cycle_num % 30 == 1:
+                    logger.info("Market regime: %s (score %d/4), breadth: %.1f%%",
+                                self.safety._current_regime, self.safety._regime_score,
+                                self.safety._current_breadth)
 
                 # 0.5 Market breadth detection (V6) — every 10 cycles to avoid rate limits
                 if cycle_num % 10 == 1:
@@ -865,6 +895,10 @@ class LiveBot:
 
     def _write_status(self):
         status = self.trader.get_status()
+        # Market judgment snapshot — lets the operator verify regime detection at a glance
+        status["market_regime"] = self.safety._current_regime
+        status["market_regime_score"] = self.safety._regime_score
+        status["market_breadth_pct"] = round(self.safety._current_breadth, 1)
         # Merge performance report into status
         try:
             report = self.performance.build_report()

@@ -39,6 +39,7 @@
     },
     "bear_market": {
       "enabled": true,
+      "btc_ma_short": 20,
       "btc_ma_fast": 50,
       "btc_ma_slow": 200,
       "btc_interval": "day",
