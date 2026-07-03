@@ -43,6 +43,8 @@
       "btc_ma_fast": 50,
       "btc_ma_slow": 200,
       "btc_interval": "day",
+      "breadth_upgrade_min": 65,
+      "breadth_downgrade_max": 35,
       "regimes": {
         "bull": {
           "max_positions": 7,
@@ -67,8 +69,7 @@
       "ema_period": 50,
       "interval": "60",
       "thresholds": [
-        [30, 1],
-        [50, 2]
+        [20, 1]
       ],
       "cache_ttl_seconds": 600
     }
