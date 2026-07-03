@@ -99,6 +99,7 @@ class LiveSafetyManager:
         # (timestamp, regime, (ema20, ema50, ema200)) — EMAs preserved for ticker-only fallback
         self._regime_cache: tuple = (0, "bull", None)
         self._current_regime: str = "bull"
+        self._btc_regime: str = "bull"
         self._regime_score: int = 4
 
         # Per-position strategy tag + custom exit params (persisted across restarts)
@@ -112,10 +113,16 @@ class LiveSafetyManager:
         self.breadth_enabled = self.market_breadth.get("enabled", True)
         self.breadth_ema_period = self.market_breadth.get("ema_period", 50)
         self.breadth_interval = self.market_breadth.get("interval", "60")
-        self.breadth_thresholds = self.market_breadth.get("thresholds", [[30, 1], [50, 2]])
+        self.breadth_thresholds = self.market_breadth.get("thresholds", [[20, 1]])
         self.breadth_cache_ttl = self.market_breadth.get("cache_ttl_seconds", 600)
-        self._breadth_cache: tuple = (0, 100.0)  # (timestamp, breadth_pct)
-        self._current_breadth: float = 100.0     # % of coins above EMA50
+        # Breadth-based regime adjustment: the regime comes from BTC, but we trade
+        # alts — when most alts are trending up (alt season) the regime is upgraded
+        # one level, and downgraded when most are trending down.
+        self.breadth_upgrade_min = self.bear_market.get("breadth_upgrade_min", 65)
+        self.breadth_downgrade_max = self.bear_market.get("breadth_downgrade_max", 35)
+        # Start at 50 (no modifier) until first real measurement
+        self._breadth_cache: tuple = (0, 50.0)   # (timestamp, breadth_pct)
+        self._current_breadth: float = 50.0      # % of coins above EMA50
 
     def advance_cycle(self):
         self.cycle_count += 1
@@ -213,6 +220,23 @@ class LiveSafetyManager:
             return "neutral", score
         return "bear", score
 
+    def _apply_breadth_modifier(self, regime: str) -> str:
+        """Adjust the BTC-based regime by alt-market breadth.
+
+        The bot trades ~50 altcoins, so BTC alone misclassifies alt seasons
+        (BTC flat/lagging while alts rally → 'neutral'/'bear' starves buying)
+        and blow-off tops (BTC strong while alts bleed). Strong breadth
+        upgrades one level, weak breadth downgrades one level."""
+        if not self.breadth_enabled:
+            return regime
+        levels = ["bear", "neutral", "bull"]
+        idx = levels.index(regime) if regime in levels else 1
+        if self._current_breadth >= self.breadth_upgrade_min:
+            idx = min(len(levels) - 1, idx + 1)
+        elif self._current_breadth <= self.breadth_downgrade_max:
+            idx = max(0, idx - 1)
+        return levels[idx]
+
     def detect_market_regime(self, api) -> str:
         """Detect market regime using BTC EMA20/EMA50/EMA200 on DAILY candles.
         Returns 'bull', 'neutral', or 'bear'. Cached for regime_cache_ttl seconds.
@@ -258,14 +282,17 @@ class LiveSafetyManager:
             if ema20 is None or ema50 is None or ema200 is None:
                 return self._current_regime
 
-            regime, score = self._classify_regime(current_price, ema20, ema50, ema200)
+            btc_regime, score = self._classify_regime(current_price, ema20, ema50, ema200)
+            regime = self._apply_breadth_modifier(btc_regime)
 
             self._regime_cache = (now, regime, (ema20, ema50, ema200))
             self._regime_score = score
+            self._btc_regime = btc_regime
             if regime != self._current_regime:
                 logger.info(
-                    "Market regime changed: %s → %s (score %d/4, BTC=₩%.0f, EMA%d=₩%.0f, EMA%d=₩%.0f, EMA%d=₩%.0f)",
-                    self._current_regime, regime, score, current_price,
+                    "Market regime changed: %s → %s (BTC %s score %d/4, breadth %.0f%%, BTC=₩%.0f, EMA%d=₩%.0f, EMA%d=₩%.0f, EMA%d=₩%.0f)",
+                    self._current_regime, regime, btc_regime, score, self._current_breadth,
+                    current_price,
                     self.btc_ma_short, ema20, self.btc_ma_fast, ema50, self.btc_ma_slow, ema200,
                 )
             self._current_regime = regime
@@ -279,14 +306,17 @@ class LiveSafetyManager:
                     tickers = api.get_ticker(["KRW-BTC"])
                     if tickers:
                         btc_price = tickers[0]["trade_price"]
-                        regime, score = self._classify_regime(btc_price, *cached_emas)
+                        btc_regime, score = self._classify_regime(btc_price, *cached_emas)
+                        regime = self._apply_breadth_modifier(btc_regime)
                         # Don't update EMA cache — only refresh timestamp + regime
                         self._regime_cache = (now, regime, cached_emas)
                         self._regime_score = score
+                        self._btc_regime = btc_regime
                         if regime != self._current_regime:
                             logger.info(
-                                "Market regime changed (ticker fallback): %s → %s (score %d/4, BTC=₩%.0f)",
-                                self._current_regime, regime, score, btc_price,
+                                "Market regime changed (ticker fallback): %s → %s (BTC %s score %d/4, breadth %.0f%%, BTC=₩%.0f)",
+                                self._current_regime, regime, btc_regime, score,
+                                self._current_breadth, btc_price,
                             )
                         self._current_regime = regime
                         return regime
@@ -685,17 +715,18 @@ class LiveBot:
             try:
                 self.safety.advance_cycle()
 
-                # 0. Market regime detection (V5)
+                # 0. Market breadth (V6) — computed BEFORE regime detection since
+                #    it feeds the breadth modifier; every 10 cycles (rate limits)
+                if cycle_num % 10 == 1:
+                    self.safety.detect_market_breadth(self.api, self.markets)
+
+                # 0.5 Market regime detection (V5, BTC daily + breadth modifier)
                 self.safety.detect_market_regime(self.api)
                 # Periodic heartbeat so the operator can see the current judgment
                 if cycle_num % 30 == 1:
-                    logger.info("Market regime: %s (score %d/4), breadth: %.1f%%",
-                                self.safety._current_regime, self.safety._regime_score,
-                                self.safety._current_breadth)
-
-                # 0.5 Market breadth detection (V6) — every 10 cycles to avoid rate limits
-                if cycle_num % 10 == 1:
-                    self.safety.detect_market_breadth(self.api, self.markets)
+                    logger.info("Market regime: %s (BTC %s score %d/4, breadth %.1f%%)",
+                                self.safety._current_regime, self.safety._btc_regime,
+                                self.safety._regime_score, self.safety._current_breadth)
 
                 # 1. Safety check — violations block BUYS only; exits/sells must
                 #    keep running so losing positions aren't trapped.
@@ -897,6 +928,7 @@ class LiveBot:
         status = self.trader.get_status()
         # Market judgment snapshot — lets the operator verify regime detection at a glance
         status["market_regime"] = self.safety._current_regime
+        status["market_regime_btc"] = self.safety._btc_regime
         status["market_regime_score"] = self.safety._regime_score
         status["market_breadth_pct"] = round(self.safety._current_breadth, 1)
         # Merge performance report into status
