@@ -46,13 +46,72 @@ class LiveUpbitAPI:
         self.max_retries = 3
         self.retry_delay = 2.0  # seconds
 
+        # --- Per-group request pacing -------------------------------------
+        # Upbit enforces BOTH a per-minute cap (candles: 600/min) and a
+        # per-second cap. The bot requests ~96 candles/min — comfortably under
+        # the minute cap — but fired them as a single burst (~70 req/s), which
+        # tripped the per-second limiter and produced 429s on ~85% of calls
+        # (measured 2026-09-25).
+        #
+        # Rather than guessing a fixed interval (which drifts as the universe
+        # grows and as other clients share the IP quota), we pace adaptively
+        # using the server's own `Remaining-Req: ...; sec=N` header. That
+        # value IS the authoritative per-second quota signal, so reacting to
+        # it keeps us under the limit without over-throttling.
+        self._group_base_interval: Dict[str, float] = {
+            "candles": 0.10,     # floor; only paid when the header is unavailable
+            "ticker": 0.05,
+            "orderbook": 0.05,
+            "market": 0.05,
+        }
+        self._default_base_interval = 0.05
+        # When the header reports this few requests left in the window, pause.
+        self._quota_low_watermark = 1
+        self._quota_pause = 0.25      # seconds to yield when quota is exhausted
+        self._last_request_at: Dict[str, float] = {}   # group → monotonic ts
+        self._throttle_lock = __import__('threading').Lock()
+
         # Rate limit tracking per group (from Remaining-Req header)
-        self._rate_limits: Dict[str, int] = {}  # group → remaining sec
+        self._rate_limits: Dict[str, int] = {}  # group → remaining this second
         self._rate_limit_lock = __import__('threading').Lock()
 
         # Accounts cache — 1s TTL to avoid redundant /accounts calls within a cycle
         self._accounts_cache: Optional[List[Dict]] = None
         self._accounts_cache_time: float = 0.0
+
+    def _throttle(self, group: str):
+        """Pace requests in a rate-limit group so a cycle's calls are spread
+        out instead of bursting into the per-second limiter.
+
+        Strategy: a small base interval keeps requests from arriving back to
+        back; then, if the server's `Remaining-Req: ...; sec=N` header shows
+        the per-second quota nearly exhausted, yield until it refills. The
+        header is the authoritative signal, so this neither over-throttles a
+        healthy connection nor ignores a real limit.
+        """
+        base = self._group_base_interval.get(group, self._default_base_interval)
+
+        with self._throttle_lock:
+            # 1. Enforce the minimum spacing within this group.
+            if base > 0:
+                now = time.monotonic()
+                last = self._last_request_at.get(group, 0.0)
+                wait = base - (now - last)
+                if wait > 0:
+                    time.sleep(wait)
+                    now = time.monotonic()
+                self._last_request_at[group] = now
+
+            # 2. Yield while the per-second quota is (nearly) spent. Capped so
+            #    a stale/misparsed header can never stall the bot indefinitely.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with self._rate_limit_lock:
+                    remaining = self._rate_limits.get(group)
+                if remaining is None or remaining > self._quota_low_watermark:
+                    break
+                time.sleep(self._quota_pause)
+                self._last_request_at[group] = time.monotonic()
 
     def _update_rate_limit(self, resp):
         """Parse Remaining-Req header and update rate limit tracking."""
@@ -72,21 +131,6 @@ class LiveUpbitAPI:
                 elif k == "sec" and group:
                     with self._rate_limit_lock:
                         self._rate_limits[group] = int(v)
-
-    def _wait_for_quota(self, group: str, min_quota: int = 1):
-        """Wait until we have at least min_quota remaining for the given group."""
-        import time as _time
-        waited = 0
-        max_wait = 5.0  # max 5 seconds wait
-        while waited < max_wait:
-            with self._rate_limit_lock:
-                remaining = self._rate_limits.get(group, 10)  # default optimistic
-            if remaining >= min_quota:
-                return
-            sleep_time = min(0.5, max_wait - waited)
-            _time.sleep(sleep_time)
-            waited += sleep_time
-        # If we timed out, just proceed anyway
 
     def _auth_headers(self, query: Optional[Dict] = None) -> Dict[str, str]:
         payload = {
@@ -113,6 +157,9 @@ class LiveUpbitAPI:
 
         for attempt in range(self.max_retries):
             try:
+                # Space requests out per rate-limit group (see _throttle).
+                self._throttle(rate_limit_group or "default")
+
                 if method == "GET":
                     resp = self.session.get(url, params=params, headers=headers, timeout=15)
                 elif method == "POST":
@@ -126,9 +173,18 @@ class LiveUpbitAPI:
                 self._update_rate_limit(resp)
 
                 if resp.status_code == 429:
+                    # Honour the server's own signal when available, else back
+                    # off. With proper pacing upstream this should rarely fire;
+                    # when it does, the limiter needs a real pause, so this
+                    # waits longer than the old flat 2s.
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        wait = float(ra) if ra else self.retry_delay * (attempt + 1)
+                    except (TypeError, ValueError):
+                        wait = self.retry_delay * (attempt + 1)
                     logger.warning("Rate limit hit (429) — attempt %d/%d, waiting %.1fs",
-                                   attempt + 1, self.max_retries, self.retry_delay)
-                    time.sleep(self.retry_delay * (attempt + 1))
+                                   attempt + 1, self.max_retries, wait)
+                    time.sleep(wait)
                     continue
 
                 if resp.status_code == 418:
@@ -151,11 +207,13 @@ class LiveUpbitAPI:
     # Public API (same as paper bot)
     # ------------------------------------------------------------------
     def get_market_list(self) -> List[Dict]:
-        return self._request("GET", "/market/all", {"isDetails": "true"}, auth=False) or []
+        return self._request("GET", "/market/all", {"isDetails": "true"}, auth=False,
+                             rate_limit_group="market") or []
 
     def get_ticker(self, markets: List[str]) -> List[Dict]:
         market_str = ",".join(markets)
-        return self._request("GET", "/ticker", {"markets": market_str}, auth=False) or []
+        return self._request("GET", "/ticker", {"markets": market_str}, auth=False,
+                             rate_limit_group="ticker") or []
 
     def get_candles(self, market: str, interval: str = "60", count: int = 100) -> List[Dict]:
         endpoint = f"/candles/minutes/{interval}"
@@ -169,7 +227,7 @@ class LiveUpbitAPI:
         (Upbit caps each request at 200 candles). Returns newest-first."""
         if count <= 200:
             return self._request("GET", endpoint, {"market": market, "count": count},
-                                 auth=False, rate_limit_group="candle") or []
+                                 auth=False, rate_limit_group="candles") or []
 
         results: List[Dict] = []
         seen = set()
@@ -178,7 +236,7 @@ class LiveUpbitAPI:
             params = {"market": market, "count": 200}
             if to:
                 params["to"] = to
-            chunk = self._request("GET", endpoint, params, auth=False, rate_limit_group="candle") or []
+            chunk = self._request("GET", endpoint, params, auth=False, rate_limit_group="candles") or []
             new = [c for c in chunk if c.get("candle_date_time_utc") not in seen]
             if not new:
                 break
@@ -193,7 +251,8 @@ class LiveUpbitAPI:
 
     def get_orderbook(self, markets: List[str]) -> List[Dict]:
         market_str = ",".join(markets)
-        return self._request("GET", "/orderbook", {"markets": market_str}, auth=False) or []
+        return self._request("GET", "/orderbook", {"markets": market_str}, auth=False,
+                             rate_limit_group="orderbook") or []
 
     # ------------------------------------------------------------------
     # Private API — Account
