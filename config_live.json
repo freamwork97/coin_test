@@ -6,7 +6,7 @@
     "enabled": true,
     "initial_balance_krw": 0,
     "fee_rate": 0.0005,
-    "markets": ["KRW-XLM", "KRW-XRP", "KRW-BTC", "KRW-WLD", "KRW-ETH", "KRW-ONDO", "KRW-MEGA", "KRW-SOL", "KRW-TRUST", "KRW-BIO", "KRW-NEAR", "KRW-DOGE", "KRW-JTO", "KRW-AERGO", "KRW-BLEND", "KRW-CHIP", "KRW-AQT", "KRW-SUI", "KRW-SAHARA", "KRW-XPL", "KRW-PROS", "KRW-MET2", "KRW-ENA", "KRW-IP", "KRW-SPX", "KRW-AVAX", "KRW-KERNEL", "KRW-ID", "KRW-CHZ", "KRW-ADA", "KRW-VIRTUAL", "KRW-PENGU", "KRW-UNI", "KRW-BCH", "KRW-TRUMP", "KRW-CFG", "KRW-ORCA", "KRW-SLX", "KRW-MOVE", "KRW-LINK", "KRW-ZBT", "KRW-RENDER", "KRW-ZKP", "KRW-BLUR", "KRW-WAL", "KRW-IRYS", "KRW-AERO", "KRW-PLUME", "KRW-TAO", "KRW-ALGO"],
+    "markets": ["KRW-XLM", "KRW-XRP", "KRW-BTC", "KRW-WLD", "KRW-ETH", "KRW-ONDO", "KRW-MEGA", "KRW-SOL", "KRW-TRUST", "KRW-BIO", "KRW-NEAR", "KRW-DOGE", "KRW-JTO", "KRW-BLEND", "KRW-CHIP", "KRW-SUI", "KRW-SAHARA", "KRW-XPL", "KRW-PROS", "KRW-MET2", "KRW-ENA", "KRW-SPX", "KRW-AVAX", "KRW-KERNEL", "KRW-ID", "KRW-CHZ", "KRW-ADA", "KRW-VIRTUAL", "KRW-PENGU", "KRW-UNI", "KRW-BCH", "KRW-TRUMP", "KRW-CFG", "KRW-ORCA", "KRW-SLX", "KRW-MOVE", "KRW-LINK", "KRW-ZBT", "KRW-RENDER", "KRW-ZKP", "KRW-BLUR", "KRW-WAL", "KRW-IRYS", "KRW-AERO", "KRW-PLUME", "KRW-TAO", "KRW-ALGO", "KRW-VANA"],
     "cycle_seconds": 60,
     "position_size_pct": 0.15
   },
@@ -43,8 +43,8 @@
       "btc_ma_fast": 50,
       "btc_ma_slow": 200,
       "btc_interval": "day",
-      "breadth_upgrade_min": 65,
-      "breadth_downgrade_max": 35,
+      "breadth_upgrade_min": 55,
+      "breadth_downgrade_max": 30,
       "regimes": {
         "bull": {
           "max_positions": 7,

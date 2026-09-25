@@ -426,7 +426,22 @@ class LiveSafetyManager:
         # 3. MDD
         mdd = (trader.peak_value - pv) / trader.peak_value if trader.peak_value > 0 else 0
         if mdd > abs(self.max_mdd_rate):
-            violations.append(f"MDD {mdd:.2%} exceeds limit {abs(self.max_mdd_rate):.2%}")
+            # Deadlock guard: with no open positions there is nothing left to
+            # recover the drawdown — the bot can only wait, so a halt here would
+            # freeze it indefinitely (observed 2026-09-22 → 2026-09-25).
+            # The halt exists to stop adding risk, not to stop trading forever.
+            # Reset the peak to the current, fully-cash portfolio value so the
+            # drawdown baseline reflects the equity actually still at risk.
+            if not positions and pv > 0:
+                logger.warning(
+                    "MDD %.2f%% exceeds limit %.2f%% with no open positions — "
+                    "resetting peak ₩%.0f → ₩%.0f (deadlock guard, buys re-enabled)",
+                    mdd * 100, abs(self.max_mdd_rate) * 100, trader.peak_value, pv,
+                )
+                trader.peak_value = pv
+                mdd = 0.0
+            else:
+                violations.append(f"MDD {mdd:.2%} exceeds limit {abs(self.max_mdd_rate):.2%}")
 
         # 4. Daily loss
         today = datetime.now().strftime("%Y-%m-%d")
@@ -637,6 +652,21 @@ class LiveBot:
             })
 
         self.markets = self.config["live_trading"]["markets"]
+        # Delisted-market guard: Upbit returns HTTP 404 for coins that were
+        # delisted (e.g. KRW-AERGO, KRW-AQT) while they linger in the config
+        # universe. Each cycle retried them 3x and the resulting burst of
+        # requests also tripped the 429 rate limiter, slowing every cycle.
+        # Drop any market the exchange no longer lists, before trading starts.
+        try:
+            listed = {m["market"] for m in self.api.get_market_list()}
+            if listed:
+                removed = [m for m in self.markets if m not in listed]
+                if removed:
+                    logger.warning("Pruned delisted markets from universe: %s", removed)
+                    self.markets = [m for m in self.markets if m in listed]
+                    logger.info("Universe reduced to %d markets", len(self.markets))
+        except Exception as e:
+            logger.warning("Could not validate market universe against exchange: %s", e)
         self.cycle_seconds = self.config["live_trading"]["cycle_seconds"]
         self.running = False
         self.last_report_day = None
