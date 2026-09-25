@@ -146,16 +146,39 @@ class LiveUpbitAPI:
         jwt_token = jwt.encode(payload, self.secret_key)
         return {"Authorization": f"Bearer {jwt_token}"}
 
+    @staticmethod
+    def _error_detail(resp) -> str:
+        """Extract Upbit's error name/message from a failed response body.
+
+        Upbit returns {"error": {"name": "insufficient_funds_bid", "message":
+        "주문 가능한 금액(KRW)이 부족합니다."}}. Logging only the HTTP status
+        threw this away, which is why order failures were undiagnosable.
+        """
+        try:
+            body = resp.json()
+            err = body.get("error", body) if isinstance(body, dict) else {}
+            name = err.get("name", "")
+            msg = err.get("message", "")
+            return f"{name} — {msg}" if name or msg else resp.text[:200]
+        except Exception:
+            return resp.text[:200] or "(no body)"
+
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
                  data: Optional[Dict] = None, auth: bool = True,
                  rate_limit_group: Optional[str] = None) -> Any:
         url = f"{self.base_url}{endpoint}"
-        headers = {}
-        if auth:
-            headers = self._auth_headers(params if method == "GET" else data)
-        headers["Content-Type"] = "application/json"
+        headers = {"Content-Type": "application/json"}
 
         for attempt in range(self.max_retries):
+            # Re-sign every attempt. A JWT carries a one-time nonce, and Upbit
+            # rejects a reused nonce with 401 "This temporary number has already
+            # been used." Generating the headers once outside the loop meant
+            # every retry was guaranteed to fail with a misleading 401 that hid
+            # the real error (400) that triggered the retry.
+            if auth:
+                headers = self._auth_headers(params if method == "GET" else data)
+            headers["Content-Type"] = "application/json"
+
             try:
                 # Space requests out per rate-limit group (see _throttle).
                 self._throttle(rate_limit_group or "default")
@@ -192,8 +215,27 @@ class LiveUpbitAPI:
                     time.sleep(60)
                     continue
 
+                # A 4xx (other than 429/418) is a deterministic rejection: the
+                # request will fail identically on every retry, so retrying only
+                # delays the failure and masks it behind an auth error. Surface
+                # the server's reason immediately instead.
+                if 400 <= resp.status_code < 500:
+                    detail = self._error_detail(resp)
+                    logger.error("%s %s rejected (%d): %s", method, endpoint,
+                                 resp.status_code, detail)
+                    return None
+
                 resp.raise_for_status()
-                return resp.json()
+                body = resp.json()
+
+                # Any successful order changes balances, so the cached snapshot
+                # is stale the moment this returns. Dropping it here covers
+                # every caller (buy, sell, cancel) instead of relying on each
+                # one to remember.
+                if endpoint.rstrip("/") == "/orders":
+                    self.invalidate_accounts_cache()
+
+                return body
 
             except requests.exceptions.RequestException as e:
                 if attempt < self.max_retries - 1:
@@ -279,6 +321,19 @@ class LiveUpbitAPI:
     # ------------------------------------------------------------------
     # Private API — Orders
     # ------------------------------------------------------------------
+    def invalidate_accounts_cache(self):
+        """Drop the cached balance snapshot.
+
+        The accounts cache exists to avoid redundant /accounts calls within a
+        cycle, but it must not survive a balance-changing event. When several
+        buys happen in one cycle, a stale snapshot makes the bot size the next
+        order against money it already spent, which Upbit rejects with 400
+        insufficient_funds_bid (observed 2026-09-25: WLD filled at 21:13:14.857
+        and PENGU was sized off the same pre-buy balance 366ms later).
+        """
+        self._accounts_cache = None
+        self._accounts_cache_time = 0.0
+
     def market_buy(self, market: str, amount_krw: float) -> Optional[Dict]:
         """
         Market buy — spend exactly `amount_krw` KRW.
