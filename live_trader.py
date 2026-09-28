@@ -109,6 +109,21 @@ class LiveTrader:
                 pnl[m] = (price_map[m] - avg) * vol
         return pnl
 
+    def _await_order_done(self, uuid: str, timeout: float = 10.0, interval: float = 0.5) -> Optional[Dict]:
+        """Poll get_order until the order reaches 'done' state or timeout expires.
+
+        Returns the final order dict on confirmation, or None if the fill
+        could not be confirmed within timeout (caller must treat as unconfirmed).
+        """
+        deadline = time.time() + timeout
+        while True:
+            detail = self.api.get_order(uuid)
+            if detail and detail.get("state") == "done":
+                return detail
+            if time.time() >= deadline:
+                return None
+            time.sleep(interval)
+
     def buy(self, market: str, amount_krw: float) -> Optional[Dict]:
         """Execute real market buy. Returns order dict or None."""
         krw = self.get_krw_balance()
@@ -128,12 +143,15 @@ class LiveTrader:
         uuid = order.get("uuid")
         executed_volume = "0"
         paid_fee = "0"
+        confirmed = False
         if uuid:
-            time.sleep(0.3)  # brief wait for order to settle
-            detail = self.api.get_order(uuid)
+            detail = self._await_order_done(uuid)
             if detail:
+                confirmed = True
                 executed_volume = str(detail.get("executed_volume", "0") or "0")
                 paid_fee = str(detail.get("paid_fee", "0") or "0")
+            else:
+                logger.warning("BUY %s fill NOT confirmed (uuid=%s) — verify manually", market, uuid)
 
         # Record trade
         trade = {
@@ -143,6 +161,7 @@ class LiveTrader:
             "amount_krw": amount_krw,
             "volume_executed": executed_volume,
             "fee": paid_fee,
+            "confirmed": confirmed,
             "timestamp": order.get("created_at") or datetime.now().isoformat(),
         }
         self._record_trade(trade)
@@ -171,18 +190,23 @@ class LiveTrader:
             return None
 
         # Retrieve actual execution details (POST response lacks executed_volume/paid_fee)
+        # Poll until the fill is confirmed — a single delayed lookup would record
+        # partial/zero execution and corrupt realized PnL + daily-loss circuit input.
         uuid = order.get("uuid")
         executed_volume = "0"
         paid_fee = "0"
         executed_funds = "0"
-        detail = None
+        confirmed = False
         if uuid:
-            time.sleep(0.3)  # brief wait for order to settle
-            detail = self.api.get_order(uuid)
+            detail = self._await_order_done(uuid)
             if detail:
+                confirmed = True
                 executed_volume = str(detail.get("executed_volume", "0") or "0")
                 paid_fee = str(detail.get("paid_fee", "0") or "0")
                 executed_funds = str(detail.get("executed_funds", "0") or "0")
+            else:
+                logger.warning("SELL %s fill NOT confirmed (uuid=%s) — PnL skipped, metadata kept",
+                               market, uuid)
 
         # Realized PnL = proceeds - fee - cost basis
         realized_pnl = None
@@ -205,6 +229,7 @@ class LiveTrader:
             "fee": paid_fee,
             "avg_buy_price": avg_buy_price,
             "realized_pnl": realized_pnl,
+            "confirmed": confirmed,
             "timestamp": order.get("created_at") or datetime.now().isoformat(),
         }
         self._record_trade(trade)

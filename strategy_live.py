@@ -498,8 +498,9 @@ class TrendRiderStyleStrategy(BaseStrategy):
             score += 1.0
             details.append("Strong DI spread")
 
-        # Map to 0-10 (max raw ~17.5)
-        numeric = max(1, min(10, round(score * 10 / 17.5)))
+        # Map to 0-10 (max raw 14.5: 1.5+2.5+2.5+1.5+1.5+1.5+1.5+1.0+1.0;
+        # ADX/Volume strong+moderate branches are mutually exclusive)
+        numeric = max(1, min(10, round(score * 10 / 14.5)))
 
         if numeric >= 8:
             level = "STRONG"
@@ -640,13 +641,15 @@ class TrendRiderStyleStrategy(BaseStrategy):
             signals.append(("rsi_overbought", 0.8))
 
         # EXIT 2: Bearish EMA cross + MACD confirmation
+        # (no RSI gate: in a sharp selloff RSI collapses below 50 first,
+        #  which would otherwise block this exit exactly when it's needed)
         ema_f = row.get(ema_fast_key, 0)
         ema_s = row.get(ema_slow_key, 0)
         prev_ema_f = prev_row.get(ema_fast_key, 0)
         prev_ema_s = prev_row.get(ema_slow_key, 0)
         if (ema_f < ema_s and prev_ema_f >= prev_ema_s and
             not (row.get("macdhist", 0) != row.get("macdhist", 0)) and row.get("macdhist", 0) < 0 and
-            rsi_val > 50 and volume_ok):
+            volume_ok):
             signals.append(("ema_bearish_cross", 0.7))
 
         # EXIT 3: Trend broken (close < EMA200 * 0.99)

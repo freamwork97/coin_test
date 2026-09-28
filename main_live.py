@@ -779,8 +779,11 @@ class LiveBot:
                     reason = self.safety.check_forced_sell(market, self.trader, ticker_map)
                     if reason:
                         logger.warning("FORCED SELL %s — %s", market, reason)
-                        self.trader.sell(market)
-                        self.safety.on_sell(market)
+                        result = self.trader.sell(market)
+                        if result and result.get("confirmed", True):
+                            self.safety.on_sell(market)
+                        else:
+                            logger.warning("SELL %s failed/unconfirmed — keeping position metadata", market)
                 # Persist updated peak prices for trailing stops
                 self.safety._save_position_meta()
 
@@ -887,7 +890,7 @@ class LiveBot:
                             logger.info("Signal: BUY %s (%.1f%% conf, %s) — %s",
                                         sig.market, sig.confidence * 100, sig_strategy, sig.reason)
                             result = self.trader.buy(sig.market, amount)
-                            if result:
+                            if result and result.get("confirmed", True):
                                 # Get entry price from ticker (fallback: exchange avg buy price)
                                 tickers = self.api.get_ticker([sig.market])
                                 entry_price = tickers[0]["trade_price"] if tickers else \
@@ -911,8 +914,11 @@ class LiveBot:
                             continue
                         logger.info("Signal: SELL %s (%.1f%% conf, %s) — %s",
                                     sig.market, sig.confidence * 100, sig_strategy, sig.reason)
-                        self.trader.sell(sig.market)
-                        self.safety.on_sell(sig.market)
+                        result = self.trader.sell(sig.market)
+                        if result and result.get("confirmed", True):
+                            self.safety.on_sell(sig.market)
+                        else:
+                            logger.warning("SELL %s failed/unconfirmed — keeping position metadata", sig.market)
                         acted_this_cycle.add(sig.market)
 
                 # 4. Status
