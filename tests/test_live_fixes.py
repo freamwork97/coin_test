@@ -51,10 +51,14 @@ class FakeAPI:
     def get_order(self, uuid):
         self.order_polls += 1
         if not self.never_fills and self.order_polls >= self.fill_after:
+            # Mirrors the real /order payload: top-level executed_funds is NOT
+            # populated by Upbit; the traded amount only exists in trades[].funds.
             return {"uuid": uuid, "state": "done",
                     "executed_volume": self.executed_volume,
-                    "executed_funds": self.executed_funds,
-                    "paid_fee": self.paid_fee}
+                    "executed_funds": "0",
+                    "paid_fee": self.paid_fee,
+                    "trades_count": 2,
+                    "trades": [{"funds": "90000.0"}, {"funds": "60000.0"}]}
         return {"uuid": uuid, "state": "wait",
                 "executed_volume": "0", "executed_funds": "0", "paid_fee": "0"}
 
@@ -87,11 +91,28 @@ def test_sell_polls_until_done():
         assert trade["confirmed"] is True
         # Old code did a single lookup (1 poll); the fix must poll repeatedly.
         assert t.api.order_polls >= 3, f"expected polling, got {t.api.order_polls} lookup(s)"
-        assert trade["executed_funds"] == "150000"
+        # funds must come from trades[].funds (90000+60000), not the empty top-level field
+        assert trade["executed_funds"] == "150000.0", trade["executed_funds"]
         # realized = funds - fee - vol * avg_buy = 150000 - 75 - 1.5*90000
         assert trade["realized_pnl"] == 150000 - 75 - 1.5 * 90000
         assert len(t.daily_pnl) == 1  # daily-loss circuit input updated
     print("PASS test_sell_polls_until_done")
+
+
+def test_extract_execution_uses_trades_funds():
+    """Regression: top-level executed_funds is 0 on real Upbit responses."""
+    ex = live_trader.LiveTrader._extract_execution({
+        "executed_volume": "2.5", "paid_fee": "10", "executed_funds": "0",
+        "trades": [{"funds": "1000.5"}, {"funds": "2000.5"}],
+    })
+    assert ex["funds"] == 3001.0, ex
+    assert ex["volume"] == 2.5, ex
+    assert ex["fee"] == 10.0, ex
+    # no trades[] -> fall back to the legacy field
+    ex2 = live_trader.LiveTrader._extract_execution({"executed_funds": "777"})
+    assert ex2["funds"] == 777.0, ex2
+    assert live_trader.LiveTrader._extract_execution(None)["funds"] == 0.0
+    print("PASS test_extract_execution_uses_trades_funds")
 
 
 def test_sell_unconfirmed_skips_pnl():
@@ -155,6 +176,7 @@ def test_confidence_max_score_reaches_strong():
 
 if __name__ == "__main__":
     test_sell_polls_until_done()
+    test_extract_execution_uses_trades_funds()
     test_sell_unconfirmed_skips_pnl()
     test_sell_order_failure_returns_none()
     test_ema_bearish_cross_fires_when_rsi_collapsed()

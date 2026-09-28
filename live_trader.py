@@ -124,6 +124,41 @@ class LiveTrader:
                 return None
             time.sleep(interval)
 
+    @staticmethod
+    def _extract_execution(detail: Optional[Dict]) -> Dict[str, float]:
+        """Pull executed_volume / funds / fee out of a /order response.
+
+        Upbit does NOT populate the top-level `executed_funds` field — the traded
+        amount lives in `trades[].funds`. Relying on the top-level field recorded
+        every sell as 0 KRW, which silently disabled realized PnL and therefore the
+        daily-loss circuit breaker (observed 2026-06-19 ~ 2026-09-28, 480 sells).
+        """
+        if not detail:
+            return {"volume": 0.0, "funds": 0.0, "fee": 0.0}
+        try:
+            volume = float(detail.get("executed_volume") or 0)
+        except (TypeError, ValueError):
+            volume = 0.0
+        try:
+            fee = float(detail.get("paid_fee") or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+
+        funds = 0.0
+        trades = detail.get("trades") or []
+        for t in trades:
+            try:
+                funds += float(t.get("funds") or 0)
+            except (TypeError, ValueError):
+                continue
+        # Defensive fallback if the exchange ever returns funds without trades[]
+        if not trades:
+            try:
+                funds = float(detail.get("executed_funds") or 0)
+            except (TypeError, ValueError):
+                funds = 0.0
+        return {"volume": volume, "funds": funds, "fee": fee}
+
     def buy(self, market: str, amount_krw: float) -> Optional[Dict]:
         """Execute real market buy. Returns order dict or None."""
         krw = self.get_krw_balance()
@@ -147,9 +182,10 @@ class LiveTrader:
         if uuid:
             detail = self._await_order_done(uuid)
             if detail:
+                ex = self._extract_execution(detail)
                 confirmed = True
-                executed_volume = str(detail.get("executed_volume", "0") or "0")
-                paid_fee = str(detail.get("paid_fee", "0") or "0")
+                executed_volume = str(ex["volume"])
+                paid_fee = str(ex["fee"])
             else:
                 logger.warning("BUY %s fill NOT confirmed (uuid=%s) — verify manually", market, uuid)
 
@@ -200,10 +236,11 @@ class LiveTrader:
         if uuid:
             detail = self._await_order_done(uuid)
             if detail:
+                ex = self._extract_execution(detail)
                 confirmed = True
-                executed_volume = str(detail.get("executed_volume", "0") or "0")
-                paid_fee = str(detail.get("paid_fee", "0") or "0")
-                executed_funds = str(detail.get("executed_funds", "0") or "0")
+                executed_volume = str(ex["volume"])
+                paid_fee = str(ex["fee"])
+                executed_funds = str(ex["funds"])
             else:
                 logger.warning("SELL %s fill NOT confirmed (uuid=%s) — PnL skipped, metadata kept",
                                market, uuid)
