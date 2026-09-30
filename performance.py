@@ -27,7 +27,13 @@ class PerformanceMetrics:
     # Returns
     # ------------------------------------------------------------------
     def get_returns(self) -> dict:
-        # 실제 매수 원가 기준: 보유 포지션들의 avg_buy_price * volume 합계
+        """All-time return vs the persisted baseline.
+
+        This used to compare portfolio value against the *cost basis of open
+        positions*, which is not a return at all: while flat it reported
+        +865% (portfolio vs the last entry cost) and it moved with every
+        restart because the baseline was recomputed at startup.
+        """
         positions = self.trader.get_positions()
         total_invested = 0.0
         for market, volume in positions.items():
@@ -35,15 +41,12 @@ class PerformanceMetrics:
             if avg_price:
                 total_invested += avg_price * volume
 
-        # 포지션이 없으면 initial_balance를 기준으로 (초기 상태)
-        if total_invested == 0:
-            total_invested = self.trader.initial_balance
-
         pv = self.trader.get_portfolio_value()
-        tr = pv - total_invested
-        trr = tr / total_invested if total_invested > 0 else 0
+        baseline = self.trader.initial_balance
+        tr = pv - baseline
+        trr = tr / baseline if baseline > 0 else 0
         return {
-            "initial_balance": self.trader.initial_balance,
+            "initial_balance": baseline,
             "total_invested": total_invested,
             "current_balance": self.trader.get_krw_balance(),
             "portfolio_value": pv,

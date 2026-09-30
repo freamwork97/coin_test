@@ -452,8 +452,7 @@ class LiveSafetyManager:
         positions = trader.get_positions()
 
         # Update peak
-        if pv > trader.peak_value:
-            trader.peak_value = pv
+        trader.record_portfolio_value(pv)
 
         # 1. Emergency stop
         if self.emergency_stop:
@@ -472,19 +471,21 @@ class LiveSafetyManager:
         mdd = (trader.peak_value - pv) / trader.peak_value if trader.peak_value > 0 else 0
         if mdd > abs(self.max_mdd_rate):
             # Deadlock guard: with no open positions there is nothing left to
-            # recover the drawdown — the bot can only wait, so a halt here would
-            # freeze it indefinitely (observed 2026-09-22 → 2026-09-25).
-            # The halt exists to stop adding risk, not to stop trading forever.
-            # Reset the peak to the current, fully-cash portfolio value so the
-            # drawdown baseline reflects the equity actually still at risk.
+            # recover the drawdown, so a halt here would freeze the bot forever
+            # (observed 2026-09-22 → 2026-09-25).
+            #
+            # The guard releases the BUY block only. It must NOT rewrite the
+            # peak: peak_value is the MDD reference for reporting and is now
+            # persisted, so falsifying it hid the drawdown and let every restart
+            # erase the metric (observed 2026-09-28 → 2026-09-30).
+            # Re-entry risk while flat is already bounded by the daily-loss
+            # limit and the regime/confidence filters.
             if not positions and pv > 0:
                 logger.warning(
                     "MDD %.2f%% exceeds limit %.2f%% with no open positions — "
-                    "resetting peak ₩%.0f → ₩%.0f (deadlock guard, buys re-enabled)",
-                    mdd * 100, abs(self.max_mdd_rate) * 100, trader.peak_value, pv,
+                    "deadlock guard releases buys (peak ₩%.0f retained for reporting)",
+                    mdd * 100, abs(self.max_mdd_rate) * 100, trader.peak_value,
                 )
-                trader.peak_value = pv
-                mdd = 0.0
             else:
                 violations.append(f"MDD {mdd:.2%} exceeds limit {abs(self.max_mdd_rate):.2%}")
 

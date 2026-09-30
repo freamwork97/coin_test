@@ -24,6 +24,7 @@ RUNTIME_DIR = os.path.join(BOT_DIR, "runtime")
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.jsonl")
 EQUITY_FILE = os.path.join(DATA_DIR, "live_equity_curve.csv")
 DAILY_PNL_FILE = os.path.join(RUNTIME_DIR, "daily_pnl.json")
+STATE_FILE = os.path.join(RUNTIME_DIR, "trader_state.json")
 
 
 class LiveTrader:
@@ -48,15 +49,81 @@ class LiveTrader:
         self._load_daily_pnl()
         self._init_balance()
 
+    # ------------------------------------------------------------------
+    # Risk-baseline persistence
+    # ------------------------------------------------------------------
+    @property
+    def state_file(self) -> str:
+        return getattr(self, "_state_file", None) or STATE_FILE
+
+    def _load_state(self) -> Dict:
+        try:
+            with open(self.state_file) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.warning("Failed to load trader state: %s", e)
+            return {}
+
+    def _save_state(self):
+        """Persist the risk baselines.
+
+        Both baselines MUST outlive the process: they are the denominators of
+        the daily-loss and MDD limits. Recomputing them at startup silently
+        moved the limits instead of restoring them — observed 2026-09-28 →
+        2026-09-30, the daily-loss basis drifted ₩492,397 → ₩469,132 because
+        the bot had simply restarted (the same ₩-15,917 day then read as
+        -3.23% and -3.39% respectively).
+        """
+        state = {}
+        if self.initial_balance_recorded:
+            state["initial_balance"] = self.initial_balance
+        if self.peak_value > 0:
+            state["peak_value"] = self.peak_value
+        if not state:
+            return
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save trader state: %s", e)
+
+    def record_portfolio_value(self, pv: float):
+        """Track the all-time peak (MDD reference) and persist it if it rose."""
+        if pv > self.peak_value:
+            self.peak_value = pv
+            self._save_state()
+
     def _init_balance(self):
-        """Record initial balance from exchange.
-        Uses full portfolio value (KRW + coins) so restarting while invested
-        doesn't distort return/daily-loss calculations."""
+        """Restore the risk baselines; only bootstrap them when unknown.
+
+        `initial_balance` is the daily-loss denominator and `peak_value` is the
+        MDD reference. A restart must restore them, never redefine them.
+        """
+        state = self._load_state()
         pv = self.get_portfolio_value()
-        if self.initial_balance == 0:
+
+        stored_initial = state.get("initial_balance")
+        if stored_initial and stored_initial > 0:
+            self.initial_balance = float(stored_initial)
+            self.initial_balance_recorded = True
+        elif self.initial_balance == 0:
+            # First ever run (or unreadable state): adopt the live portfolio.
             self.initial_balance = pv
-        self.peak_value = pv
-        logger.info("LiveTrader initialized: portfolio value=₩%.0f", pv)
+            self.initial_balance_recorded = True
+
+        stored_peak = state.get("peak_value")
+        if stored_peak and stored_peak > 0:
+            self.peak_value = max(float(stored_peak), pv)
+        else:
+            self.peak_value = pv
+
+        self._save_state()
+        logger.info(
+            "LiveTrader initialized: portfolio value=₩%.0f (baseline=₩%.0f, peak=₩%.0f)",
+            pv, self.initial_balance, self.peak_value,
+        )
 
     def _load_daily_pnl(self):
         try:
