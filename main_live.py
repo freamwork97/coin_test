@@ -50,14 +50,15 @@ from performance import PerformanceMetrics
 class LiveSafetyManager:
     """Enhanced safety for live trading."""
 
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, meta_file: Optional[str] = None):
         s = config["safety"]
         self.max_daily_loss_rate = s["max_daily_loss_rate"]       # e.g. -0.03 (tighter for live)
         self.max_mdd_rate = s["max_mdd_rate"]                     # e.g. -0.05
         self.max_single_coin_weight = s["max_single_coin_weight"] # e.g. 0.25
         self.max_positions = s.get("max_positions", 3)            # max concurrent positions
-        self.cooldown_cycles = s.get("cooldown_cycles", 3)        # cycles after a sell before buying again
-        self.last_sell_cycle: Dict[str, int] = {}                 # market → cycle when sold
+        self.cooldown_cycles = s.get("cooldown_cycles", 3)        # minutes after a sell before buying again
+        self.last_sell_cycle: Dict[str, int] = {}                 # market → cycle when sold (in-memory only)
+        self.last_sell_time: Dict[str, float] = {}                # market → epoch when sold (persisted)
 
         # Forced-sell parameters
         self.forced_sell = s.get("forced_sell", {})
@@ -101,11 +102,20 @@ class LiveSafetyManager:
         self._current_regime: str = "bull"
         self._btc_regime: str = "bull"
         self._regime_score: int = 4
+        # Breadth hysteresis: the alt-market breadth swings across the 30%
+        # downgrade threshold almost every 10-minute sample (observed 15-44%),
+        # so a single reading used to flip the regime — and with it position
+        # sizing (15%->10%), the confidence floor (5->6) and max positions
+        # (7->6). That produced 200 regime flips and starved buying. Only
+        # sustained weakness now downgrades, and a perfect BTC score (4/4)
+        # is never overridden by breadth noise.
+        self.regime_confirm_samples = self.bear_market.get("confirm_samples", 3)
+        self._consecutive_weak_breadth: int = 0
 
         # Per-position strategy tag + custom exit params (persisted across restarts)
         self.position_strategy: Dict[str, str] = {}
         self.position_custom_exit: Dict[str, dict] = {}
-        self._meta_file = os.path.join(RUNTIME_DIR, "positions_meta.json")
+        self._meta_file = meta_file or os.path.join(RUNTIME_DIR, "positions_meta.json")
         self._load_position_meta()
 
         # Market breadth detection (V6)
@@ -140,6 +150,10 @@ class LiveSafetyManager:
             logger.warning("Failed to load position metadata: %s", e)
             return
         for market, m in meta.items():
+            if market == "cooldowns":
+                # Wall-clock sell times, so a restart does not clear the cooldown
+                self.last_sell_time = {k: float(v) for k, v in m.items()}
+                continue
             try:
                 self.position_entry_time[market] = datetime.fromisoformat(m["entry_time"])
             except Exception:
@@ -162,6 +176,8 @@ class LiveSafetyManager:
                 "strategy": self.position_strategy.get(market, "unknown"),
                 "custom_exit": self.position_custom_exit.get(market),
             }
+        if self.last_sell_time:
+            meta["cooldowns"] = dict(self.last_sell_time)
         try:
             with open(self._meta_file, "w") as f:
                 json.dump(meta, f, indent=2)
@@ -226,15 +242,44 @@ class LiveSafetyManager:
         The bot trades ~50 altcoins, so BTC alone misclassifies alt seasons
         (BTC flat/lagging while alts rally → 'neutral'/'bear' starves buying)
         and blow-off tops (BTC strong while alts bleed). Strong breadth
-        upgrades one level, weak breadth downgrades one level."""
+        upgrades one level, weak breadth downgrades one level.
+
+        Two guards keep this from becoming a noise amplifier (2026-09-30:
+        200 regime flips in a week, breadth oscillating 15-44% across the 30%
+        threshold — the bot re-sized, re-filtered and re-bought on noise):
+
+        1. BTC-score gate — when BTC itself scores 4/4 the macro trend is
+           unambiguous. Breadth of a bleeding alt market may not downgrade it.
+        2. Hysteresis + deadband — a downgrade needs `regime_confirm_samples`
+           consecutive weak readings, and breadth must recover above the band
+           before it can trigger again.
+        """
         if not self.breadth_enabled:
             return regime
         levels = ["bear", "neutral", "bull"]
         idx = levels.index(regime) if regime in levels else 1
-        if self._current_breadth >= self.breadth_upgrade_min:
+
+        weak = self._current_breadth <= self.breadth_downgrade_max
+        strong = self._current_breadth >= self.breadth_upgrade_min
+
+        # Deadband: once weak, require a recovery above the downgrade threshold
+        # before the weak branch can re-arm.
+        if weak:
+            self._consecutive_weak_breadth += 1
+        else:
+            self._consecutive_weak_breadth = 0
+
+        if strong:
             idx = min(len(levels) - 1, idx + 1)
-        elif self._current_breadth <= self.breadth_downgrade_max:
-            idx = max(0, idx - 1)
+        elif weak and self._consecutive_weak_breadth >= self.regime_confirm_samples:
+            # BTC-score gate: never downgrade an unambiguous macro uptrend.
+            if self._regime_score >= 4 and self._btc_regime == "bull":
+                logger.debug(
+                    "Breadth %.0f%% weak but BTC score 4/4 — downgrade suppressed",
+                    self._current_breadth,
+                )
+            else:
+                idx = max(0, idx - 1)
         return levels[idx]
 
     def detect_market_regime(self, api) -> str:
@@ -480,16 +525,21 @@ class LiveSafetyManager:
                         len(positions), effective_max, self._current_regime)
             return False
 
-        # Cooldown after selling this market
-        if market in self.last_sell_cycle:
-            cycles_since = self.cycle_count - self.last_sell_cycle[market]
-            if cycles_since < self.cooldown_cycles:
-                logger.info("Cooldown active for %s (%d/%d cycles)", market, cycles_since, self.cooldown_cycles)
+        # Cooldown after selling this market.
+        # Stored as a wall-clock timestamp, not a cycle counter: the counter was
+        # reset by every restart, which is how WLD was re-bought 1h after a
+        # stop-loss and NEAR 1.2h after a cascading cut (2026-09-29/30).
+        if market in self.last_sell_time:
+            elapsed_min = (time.time() - self.last_sell_time[market]) / 60
+            if elapsed_min < self.cooldown_cycles:
+                logger.debug("Cooldown active for %s (%.0f/%.0f min)",
+                             market, elapsed_min, self.cooldown_cycles)
                 return False
 
         return True
 
     def on_sell(self, market: str):
+        self.last_sell_time[market] = time.time()
         self.last_sell_cycle[market] = self.cycle_count
         self.position_entry_time.pop(market, None)
         self.position_entry_price.pop(market, None)

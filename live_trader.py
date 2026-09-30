@@ -110,16 +110,32 @@ class LiveTrader:
         return pnl
 
     def _await_order_done(self, uuid: str, timeout: float = 10.0, interval: float = 0.5) -> Optional[Dict]:
-        """Poll get_order until the order reaches 'done' state or timeout expires.
+        """Poll get_order until the order reaches a terminal state.
 
-        Returns the final order dict on confirmation, or None if the fill
-        could not be confirmed within timeout (caller must treat as unconfirmed).
+        Returns the final order dict on confirmation, or None if no fill could
+        be confirmed within the timeout (caller must treat as unconfirmed).
+
+        Upbit does NOT report a fully-executed market BUY as state='done'.
+        Every one of the 506 market buys observed 2026-06-19..09-30 came back
+        as state='cancel' (the KRW remainder that could not be spent is
+        cancelled) with executed_volume > 0. Accepting only 'done' therefore
+        reported real fills as unconfirmed. A 'cancel' order counts as filled
+        only when it actually executed something.
         """
         deadline = time.time() + timeout
         while True:
             detail = self.api.get_order(uuid)
-            if detail and detail.get("state") == "done":
-                return detail
+            if detail:
+                state = detail.get("state")
+                try:
+                    executed = float(detail.get("executed_volume") or 0)
+                except (TypeError, ValueError):
+                    executed = 0.0
+                if state == "done" or (state == "cancel" and executed > 0):
+                    return detail
+                if state in ("cancel", "reject"):
+                    # Terminal and nothing filled — no point polling further.
+                    return None
             if time.time() >= deadline:
                 return None
             time.sleep(interval)
