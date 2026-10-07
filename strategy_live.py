@@ -1178,6 +1178,110 @@ class MeanReversionStrategy(BaseStrategy):
         return signals
 
 
+class GateMomentumStrategy(BaseStrategy):
+    """V8 — BTC-regime gate + cross-sectional momentum rotation.
+
+    Backtested 2024-07→2026-10 on 8 majors (fee 0.05% + slip 0.05%/side):
+      full  +241.8% / MDD 35.8% / Sharpe 1.52        (maxpos=3, 30d lookback)
+      walk-forward 4/5 folds positive, median +11.3%, md_sharpe 1.01
+    Parameter plateau: gate 10/30 … 50/100 all +145%…+245% (not a curve-fit spike).
+
+    Structure (deliberately simple — every extra knob is an overfit risk):
+      1. Gate   : risk-ON only while BTC close > EMA(gate_fast) > EMA(gate_slow)
+                  on DAILY closes. Otherwise go to CASH (emit sells).
+      2. Rank   : every market by `lookback`-day return.
+      3. Hold   : top-`topk` markets with POSITIVE momentum; rotate out the rest.
+
+    Why this and not the old TrendRider/RSI/MR stack: over 2024-07→2026-09 the
+    alt universe returned a median -47% (5 of 22 markets positive). Long-only
+    rotation without a regime gate lost in every walk-forward fold. The gate is
+    what converts a losing long-only book into a defensible one.
+    """
+
+    def __init__(self, config: Dict):
+        super().__init__(config)
+        p = config.get("params", {})
+        self.gate_fast = p.get("gate_fast", 20)
+        self.gate_slow = p.get("gate_slow", 50)
+        self.lookback = p.get("lookback", 30)
+        self.topk = p.get("topk", 3)
+        self.gate_market = p.get("gate_market", "KRW-BTC")
+        self.min_confidence = p.get("min_confidence", 1)
+
+    @staticmethod
+    def _ema_last(prices: List[float], period: int) -> Optional[float]:
+        """EMA of a chronological price list, returned at the last bar."""
+        if len(prices) < period:
+            return None
+        k = 2 / (period + 1)
+        e = sum(prices[:period]) / period
+        for x in prices[period:]:
+            e = (x - e) * k + e
+        return e
+
+    def _daily(self, api, market: str, need: int) -> List[float]:
+        candles = api.get_day_candles(market, need)
+        # Upbit returns newest-first; drop the still-forming bar, then reverse
+        candles = candles[1:]
+        return [c["trade_price"] for c in reversed(candles)]
+
+    def _gate_on(self, api) -> bool:
+        px = self._daily(api, self.gate_market, self.gate_slow + 20)
+        if len(px) < self.gate_slow:
+            return False  # fail safe → cash
+        ema_f = self._ema_last(px, self.gate_fast)
+        ema_s = self._ema_last(px, self.gate_slow)
+        if ema_f is None or ema_s is None:
+            return False
+        return px[-1] > ema_f > ema_s
+
+    def generate_signals(self, api, markets: List[str]) -> List[Signal]:
+        signals: List[Signal] = []
+
+        gate = self._gate_on(api)
+
+        # rank universe by lookback-day momentum
+        scored = []
+        for m in markets:
+            try:
+                px = self._daily(api, m, self.lookback + 5)
+                if len(px) < self.lookback + 1 or not px[-1 - self.lookback]:
+                    continue
+                momo = px[-1] / px[-1 - self.lookback] - 1
+                scored.append((momo, m))
+            except Exception as e:
+                logger.debug("GateMom momentum error %s: %s", m, e)
+        scored.sort(reverse=True)
+        top = {m for _, m in scored[: self.topk] if _ > 0} if gate else set()
+
+        for momo, m in scored:
+            if m in top:
+                signals.append(Signal(
+                    market=m, side="buy",
+                    confidence=min(0.99, max(self.min_confidence / 10, 0.5 + momo)),
+                    reason=f"GateMom risk-ON, {self.lookback}d momo {momo:+.1%} (rank)",
+                    params={"strategy": "gatemomentum", "momentum": momo},
+                ))
+        # exit: everything not in the target set (main loop only sells held ones)
+        if gate:
+            for momo, m in scored:
+                if m not in top:
+                    signals.append(Signal(
+                        market=m, side="sell", confidence=0.5,
+                        reason="GateMom rotation out (rank below top-K / negative momentum)",
+                        params={"strategy": "gatemomentum"},
+                    ))
+        else:
+            # risk-OFF → liquidate the book
+            for _, m in scored:
+                signals.append(Signal(
+                    market=m, side="sell", confidence=1.0,
+                    reason="GateMom risk-OFF: BTC below EMA gate → cash",
+                    params={"strategy": "gatemomentum"},
+                ))
+        return signals
+
+
 def get_strategy(config: Dict) -> BaseStrategy:
     name = config.get("name", "ma_crossover")
     if name == "ma_crossover":
@@ -1188,4 +1292,6 @@ def get_strategy(config: Dict) -> BaseStrategy:
         return RSIStrategy(config)
     elif name == "trendrider":
         return TrendRiderStyleStrategy(config)
+    elif name == "gatemomentum":
+        return GateMomentumStrategy(config)
     raise ValueError(f"Unknown strategy: {name}")

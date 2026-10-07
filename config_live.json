@@ -1,4 +1,5 @@
 {
+  "_note": "V8 (2026-10-07) — 손실 누적(승률 12%, 실현 -27,426원)으로 청산 후 전면 교체. 전략=GateMomentum: BTC 일봉 EMA20/50 게이트 + 30일 모멘텀 상위3 종목 로테이션. 백테스트 2024-07~2026-10: full +241.8%/MDD 35.8%/Sharpe 1.52, 워크포워드 4/5 구간 플러스. cascading_cut(손실 주범)과 RSI/평균회귀 스택은 비활성.",
   "upbit": {
     "base_url": "https://api.upbit.com/v1"
   },
@@ -6,36 +7,31 @@
     "enabled": true,
     "initial_balance_krw": 0,
     "fee_rate": 0.0005,
-    "markets": ["KRW-XLM", "KRW-XRP", "KRW-BTC", "KRW-WLD", "KRW-ETH", "KRW-ONDO", "KRW-MEGA", "KRW-SOL", "KRW-TRUST", "KRW-BIO", "KRW-NEAR", "KRW-DOGE", "KRW-JTO", "KRW-BLEND", "KRW-CHIP", "KRW-SUI", "KRW-SAHARA", "KRW-XPL", "KRW-PROS", "KRW-MET2", "KRW-ENA", "KRW-SPX", "KRW-AVAX", "KRW-KERNEL", "KRW-ID", "KRW-CHZ", "KRW-ADA", "KRW-VIRTUAL", "KRW-PENGU", "KRW-UNI", "KRW-BCH", "KRW-TRUMP", "KRW-CFG", "KRW-ORCA", "KRW-SLX", "KRW-MOVE", "KRW-LINK", "KRW-ZBT", "KRW-RENDER", "KRW-ZKP", "KRW-BLUR", "KRW-WAL", "KRW-IRYS", "KRW-AERO", "KRW-PLUME", "KRW-TAO", "KRW-ALGO", "KRW-VANA"],
-    "cycle_seconds": 60,
-    "position_size_pct": 0.15
+    "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE", "KRW-ADA", "KRW-AVAX", "KRW-LINK"],
+    "cycle_seconds": 300,
+    "position_size_pct": 0.33
   },
   "safety": {
     "live_trading_enabled": true,
-    "max_daily_loss_rate": -0.03,
-    "max_mdd_rate": -0.05,
-    "max_single_coin_weight": 0.25,
-    "max_positions": 7,
+    "max_daily_loss_rate": -0.05,
+    "max_mdd_rate": -0.20,
+    "max_single_coin_weight": 0.40,
+    "max_positions": 3,
     "cooldown_cycles": 60,
     "emergency_stop": false,
     "forced_sell": {
-      "stop_loss_pct": -4.0,
-      "take_profit_pct": 10.0,
-      "max_hold_hours": 48
+      "stop_loss_pct": -20.0,
+      "take_profit_pct": 60.0,
+      "max_hold_hours": 336
     },
     "cascading_cut": {
-      "enabled": true,
-      "thresholds": [
-        [3, -2.0],
-        [6, -1.0],
-        [12, 0.0],
-        [24, 0.5]
-      ]
+      "enabled": false,
+      "thresholds": []
     },
     "trailing_stop": {
-      "enabled": true,
-      "activation_pct": 4.0,
-      "distance_pct": 2.5
+      "enabled": false,
+      "activation_pct": 15.0,
+      "distance_pct": 8.0
     },
     "bear_market": {
       "enabled": true,
@@ -46,81 +42,38 @@
       "breadth_upgrade_min": 55,
       "breadth_downgrade_max": 30,
       "regimes": {
-        "bull": {
-          "max_positions": 7,
-          "position_size_pct": 0.15,
-          "min_confidence": 5
-        },
-        "neutral": {
-          "max_positions": 4,
-          "position_size_pct": 0.10,
-          "min_confidence": 6
-        },
-        "bear": {
-          "max_positions": 2,
-          "position_size_pct": 0.05,
-          "min_confidence": 7
-        }
+        "bull": { "max_positions": 3, "position_size_pct": 0.33, "min_confidence": 1 },
+        "neutral": { "max_positions": 3, "position_size_pct": 0.33, "min_confidence": 1 },
+        "bear": { "max_positions": 3, "position_size_pct": 0.33, "min_confidence": 1 }
       },
       "cache_ttl_seconds": 300
     },
     "market_breadth": {
-      "enabled": true,
+      "enabled": false,
       "ema_period": 50,
       "interval": "60",
-      "thresholds": [
-        [20, 1]
-      ],
+      "thresholds": [[20, 1]],
       "cache_ttl_seconds": 600
     }
   },
   "strategy": {
-    "name": "trendrider",
+    "name": "gatemomentum",
     "params": {
-      "ema_fast": 9,
-      "ema_slow": 16,
-      "rsi_period": 16,
-      "rsi_pullback_low": 30,
-      "rsi_pullback_high": 65,
-      "rsi_bounce_level": 35,
-      "adx_threshold": 18,
-      "volume_factor": 0.7,
-      "rsi_exit": 78,
-      "min_confidence_bull": 5,
-      "min_confidence_bear": 6,
-      "use_4h": true,
-      "use_1d": true,
-      "use_btc_sentiment": true,
-      "interval": "60"
+      "gate_fast": 20,
+      "gate_slow": 50,
+      "lookback": 30,
+      "topk": 3,
+      "gate_market": "KRW-BTC",
+      "min_confidence": 1
     }
   },
   "rsi_fallback": {
-    "enabled": true,
-    "params": {
-      "period": 14,
-      "overbought": 70,
-      "oversold": 25,
-      "interval": "60"
-    }
+    "enabled": false,
+    "params": {}
   },
   "mean_reversion": {
-    "enabled": true,
-    "params": {
-      "rsi_period": 14,
-      "rsi_oversold": 25,
-      "rsi_exit": 55,
-      "bb_period": 20,
-      "bb_std": 2.0,
-      "bb_position_max": 0.15,
-      "volume_ratio_min": 1.0,
-      "take_profit_pct": 3.0,
-      "stop_loss_pct": -2.5,
-      "max_hold_hours": 12,
-      "position_size_pct": 0.03,
-      "max_positions": 2,
-      "btc_rsi_min": 30,
-      "interval": "60"
-    },
+    "enabled": false,
+    "params": {},
     "regimes": ["neutral", "bear"]
   }
 }

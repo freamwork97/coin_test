@@ -24,13 +24,18 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — rotating, so a long-running bot cannot grow an unbounded log
+# (bot.log had reached 109 MiB with a plain FileHandler and no rotation).
 # ---------------------------------------------------------------------------
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, "bot.log")),
+        RotatingFileHandler(os.path.join(LOG_DIR, "bot.log"),
+                            maxBytes=20 * 1024 * 1024, backupCount=5,
+                            encoding="utf-8"),
         logging.StreamHandler(sys.stderr),
     ],
 )
@@ -956,10 +961,14 @@ class LiveBot:
                         if sig.market not in positions:
                             continue
                         # Exit scoping: a strategy may only close its own positions.
-                        # Unknown (adopted) positions are managed by the primary strategy.
+                        # Unknown (adopted) positions are managed by the primary
+                        # strategy. gatemomentum owns the WHOLE book (it is a
+                        # portfolio rotator that emits sells for every market it
+                        # does not want to hold), so it may close any position.
                         pos_strategy = self.safety.position_strategy.get(sig.market, "unknown")
                         if not (pos_strategy == sig_strategy or
-                                (pos_strategy == "unknown" and sig_strategy == "trendrider")):
+                                (pos_strategy == "unknown" and sig_strategy == "trendrider") or
+                                sig_strategy == "gatemomentum"):
                             logger.debug("SELL %s from %s skipped — position owned by %s",
                                          sig.market, sig_strategy, pos_strategy)
                             continue
