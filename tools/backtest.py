@@ -120,7 +120,11 @@ def emit(tl, maps, data, per):
 # Portfolio simulation
 # ---------------------------------------------------------------------------
 def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
-             stop_loss=None, trail_act=None, trail_dist=None, start=None, end=None):
+             stop_loss=None, trail_act=None, trail_dist=None, start=None, end=None,
+             port_stop=None, port_cooldown=0):
+    """port_stop: if equity falls this fraction below its running peak, liquidate
+    and stay in cash for `port_cooldown` bars (a portfolio drawdown circuit
+    breaker). None disables it."""
     n = len(tl)
     lo = start if start is not None else 0
     hi = end if end is not None else n
@@ -129,6 +133,8 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
     equity = []
     trades = []
     exposure = 0
+    pk = initial
+    halt_until = -1
 
     for i in range(lo, hi):
         px = lambda m: closes[m][i]
@@ -153,6 +159,26 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
                                "ts": tl[i]})
                 del pos[m]
 
+        # portfolio drawdown circuit breaker
+        pv_now = cash + sum(pos[m]["qty"] * px(m) for m in pos if px(m))
+        pk = max(pk, pv_now)
+        if port_stop is not None and pk > 0:
+            if (pv_now - pk) / pk <= -port_stop and i >= halt_until:
+                halt_until = i + port_cooldown
+            if i < halt_until:
+                # forced liquidation, stay in cash
+                for m in list(pos.keys()):
+                    c = px(m)
+                    fill = c * (1 - SLIP)
+                    proceeds = pos[m]["qty"] * fill * (1 - FEE)
+                    cash += proceeds
+                    trades.append({"market": m, "pnl": proceeds - pos[m]["qty"] * pos[m]["entry"] * (1 + FEE),
+                                   "ts": tl[i]})
+                    del pos[m]
+                pv = cash
+                equity.append(pv)
+                continue
+
         want = [m for m in pref if signals.get(m, []) and signals[m][i] and px(m)]
         target = set(want[:max_positions])
 
@@ -168,9 +194,8 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
 
         new = [m for m in want if m not in pos][: max(0, max_positions - len(pos))]
         if new:
-            pv = sum(pos[m]["qty"] * px(m) for m in pos if px(m))
-            eq = cash + pv
-            alloc = min(cash * 0.99 / len(new), eq / max_positions)
+            pv = cash + sum(pos[m]["qty"] * px(m) for m in pos if px(m))
+            alloc = min(cash * 0.99 / len(new), pv / max_positions)
             for m in new:
                 c = px(m)
                 if alloc < 5000:
@@ -182,8 +207,8 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
         if pos:
             exposure += 1
 
-        pv = sum(pos[m]["qty"] * px(m) for m in pos if px(m))
-        equity.append(cash + pv)
+        pv = cash + sum(pos[m]["qty"] * px(m) for m in pos if px(m))
+        equity.append(pv)
 
     return _metrics(initial, equity, trades, exposure, hi - lo, tl[lo:hi])
 

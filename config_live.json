@@ -19,6 +19,8 @@
     "max_positions": 3,
     "cooldown_cycles": 60,
     "emergency_stop": false,
+    "portfolio_stop_pct": 0.15,
+    "portfolio_stop_cooldown_hours": 12,
     "forced_sell": {
       "stop_loss_pct": -20.0,
       "take_profit_pct": 60.0,

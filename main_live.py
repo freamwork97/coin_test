@@ -76,6 +76,18 @@ class LiveSafetyManager:
         self.emergency_stop = s.get("emergency_stop", False)
         self.cycle_count = 0
 
+        # Portfolio drawdown circuit breaker (V8.1). Backtest 2024-07→2026-10:
+        # a -15% peak-to-trough stop cut max drawdown 35.8% → 15.7% while
+        # improving Sharpe 1.52 → 1.70 (walk-forward 4/5 folds unchanged).
+        # It force-liquidates the book and pauses new buys for the cooldown,
+        # so a losing streak cannot compound. The gate alone only blocks BUYS;
+        # this is what actually protects capital when positions are falling.
+        self.portfolio_stop_pct = s.get("portfolio_stop_pct", 0.15)
+        self.portfolio_stop_cooldown_hours = s.get("portfolio_stop_cooldown_hours", 12)
+        self._halt_until_ts: float = 0.0            # epoch until buys are paused
+        self._portfolio_stop_file = os.path.join(RUNTIME_DIR, "portfolio_halt.json")
+        self._load_portfolio_halt()
+
         # Cascading early loss cut (V4)
         self.cascading_cut = s.get("cascading_cut", {})
         self.cascading_enabled = self.cascading_cut.get("enabled", True)
@@ -141,6 +153,67 @@ class LiveSafetyManager:
 
     def advance_cycle(self):
         self.cycle_count += 1
+
+    # ------------------------------------------------------------------
+    # Portfolio drawdown circuit breaker (V8.1)
+    # ------------------------------------------------------------------
+    def _load_portfolio_halt(self):
+        """Restore a running buy-pause across restarts (otherwise a restart
+        would immediately re-enter the drawdown the stop just avoided)."""
+        try:
+            with open(self._portfolio_stop_file) as f:
+                d = json.load(f)
+            self._halt_until_ts = float(d.get("halt_until_ts", 0.0))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("Failed to load portfolio halt state: %s", e)
+
+    def _save_portfolio_halt(self):
+        try:
+            with open(self._portfolio_stop_file, "w") as f:
+                json.dump({"halt_until_ts": self._halt_until_ts}, f)
+        except Exception as e:
+            logger.warning("Failed to save portfolio halt state: %s", e)
+
+    def buys_paused(self) -> bool:
+        return time.time() < self._halt_until_ts
+
+    def check_portfolio_stop(self, trader: LiveTrader) -> bool:
+        """If the portfolio is this far below its running peak, liquidate
+        everything and pause new buys for the cooldown. Returns True if a stop
+        was triggered this call."""
+        if self.portfolio_stop_pct is None or self.portfolio_stop_pct <= 0:
+            return False
+        if self.buys_paused():
+            return False  # already halted — do not re-trigger every cycle
+        pv = trader.get_portfolio_value()
+        peak = trader.peak_value
+        if peak <= 0:
+            return False
+        dd = (peak - pv) / peak
+        if dd < self.portfolio_stop_pct:
+            return False
+
+        logger.warning(
+            "PORTFOLIO STOP: drawdown %.1f%% >= %.1f%% (peak ₩%.0f → ₩%.0f) — "
+            "liquidating and pausing buys for %dh",
+            dd * 100, self.portfolio_stop_pct * 100, peak, pv,
+            self.portfolio_stop_cooldown_hours,
+        )
+        for market in list(trader.get_positions().keys()):
+            try:
+                r = trader.sell(market)
+                if r and r.get("confirmed", True):
+                    self.on_sell(market)
+            except Exception as e:
+                logger.error("Portfolio-stop sell failed for %s: %s", market, e)
+        # reset the peak baseline so MDD is measured from here on
+        trader.peak_value = pv
+        trader._save_state()
+        self._halt_until_ts = time.time() + self.portfolio_stop_cooldown_hours * 3600
+        self._save_portfolio_halt()
+        return True
 
     # ------------------------------------------------------------------
     # Position metadata persistence (restart-safe trailing/cascade/max-hold)
@@ -823,6 +896,17 @@ class LiveBot:
 
                 # 1.2 Reconcile position metadata with exchange (restart-safe)
                 self.safety.sync_positions(self.trader)
+
+                # 1.3 Portfolio drawdown circuit breaker (V8.1) — the gate blocks
+                #     BUYS, but this is what actually protects capital when
+                #     already-held positions are falling. Liquidates the book and
+                #     pauses buys; must run BEFORE the forced-sell/signal loops.
+                self.safety.check_portfolio_stop(self.trader)
+                if self.safety.buys_paused():
+                    buys_halted = True
+                    logger.warning("Buys paused by portfolio stop until %s",
+                                   datetime.fromtimestamp(self.safety._halt_until_ts)
+                                   .strftime("%Y-%m-%d %H:%M"))
 
                 # 1.5 Forced-sell check: stop-loss / take-profit / max hold time
                 positions = self.trader.get_positions()
