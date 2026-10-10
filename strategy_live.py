@@ -1282,8 +1282,140 @@ class GateMomentumStrategy(BaseStrategy):
         return signals
 
 
+class GatedCoreSatelliteStrategy(BaseStrategy):
+    """V9 — BTC regime gate + BTC core + (small) momentum satellite, WEIGHTED.
+
+    Replaces V8.1 GateMomentum, which bought the three largest 30-day movers at
+    ~99% exposure and lost -9.7% in two days (2026-10-07→09): the momentum tops
+    rolled over, and the daily BTC EMA gate only flipped off after the drop.
+
+    Defects fixed, one per rule:
+      1. Concentration      → fixed weights instead of 3 equal alts at 99%:
+                               core 70% of portfolio value, each satellite 20%.
+      2. Top-chasing        → satellites must be positive AND not over-extended
+                               (lookback return <= max_momo, default +30%).
+      3. Weak individual    → a satellite must be in its OWN uptrend
+         names               (close > EMA(sat_trend_ema)).
+      4. Late regime exit   → gate stays BTC EMA20/50 (validated), but the book
+                               is now BTC-heavy, so a gate flip costs far less.
+
+    Signals carry `params["weight"]` so the live engine can size each leg.
+    """
+
+    def __init__(self, config: Dict):
+        super().__init__(config)
+        p = config.get("params", {})
+        self.gate_fast = p.get("gate_fast", 20)
+        self.gate_slow = p.get("gate_slow", 50)
+        self.lookback = p.get("lookback", 14)
+        self.satk = p.get("satk", 1)
+        self.max_momo = p.get("max_momo", 0.30)
+        self.core_weight = p.get("core_weight", 0.70)
+        self.sat_weight = p.get("sat_weight", 0.20)
+        self.core_market = p.get("core_market", "KRW-BTC")
+        self.gate_market = p.get("gate_market", "KRW-BTC")
+        self.sat_trend_ema = p.get("sat_trend_ema", 50)
+
+    @staticmethod
+    def _ema_last(prices: List[float], period: int) -> Optional[float]:
+        if len(prices) < period:
+            return None
+        k = 2 / (period + 1)
+        e = sum(prices[:period]) / period
+        for x in prices[period:]:
+            e = (x - e) * k + e
+        return e
+
+    def _daily(self, api, market: str, need: int) -> List[float]:
+        candles = api.get_day_candles(market, need)
+        candles = candles[1:]                      # drop the still-forming bar
+        return [c["trade_price"] for c in reversed(candles)]
+
+    def _gate_on(self, api) -> bool:
+        px = self._daily(api, self.gate_market, self.gate_slow + 20)
+        if len(px) < self.gate_slow:
+            return False                            # fail safe → cash
+        ef = self._ema_last(px, self.gate_fast)
+        es = self._ema_last(px, self.gate_slow)
+        if ef is None or es is None:
+            return False
+        return px[-1] > ef > es
+
+    def generate_signals(self, api, markets: List[str]) -> List[Signal]:
+        signals: List[Signal] = []
+        try:
+            gate = self._gate_on(api)
+        except Exception as e:
+            logger.error("V9 gate check failed (%s) — failing safe to cash", e)
+            gate = False
+
+        # --- evaluate every market once: momentum + own trend ---------------
+        stats: Dict[str, dict] = {}
+        for m in markets:
+            try:
+                need = max(self.lookback + 5, self.sat_trend_ema + 5)
+                px = self._daily(api, m, need)
+                if len(px) < self.lookback + 1:
+                    continue
+                base = px[-1 - self.lookback]
+                momo = (px[-1] / base - 1) if base else None
+                ema = self._ema_last(px, self.sat_trend_ema)
+                stats[m] = {
+                    "momo": momo,
+                    "uptrend": (ema is not None and px[-1] > ema),
+                    "close": px[-1],
+                }
+            except Exception as e:
+                logger.debug("V9 stat error %s: %s", m, e)
+
+        # --- pick the target book ------------------------------------------
+        target: Dict[str, dict] = {}
+        if gate and self.core_market in stats:
+            target[self.core_market] = {"weight": self.core_weight, "role": "core",
+                                        "reason": "V9 core (BTC regime gate ON)"}
+            sats = [
+                (s["momo"], m) for m, s in stats.items()
+                if m != self.core_market
+                and s["momo"] is not None and 0 < s["momo"] <= self.max_momo
+                and s["uptrend"]
+            ]
+            sats.sort(reverse=True)
+            for momo, m in sats[: self.satk]:
+                target[m] = {"weight": self.sat_weight, "role": "satellite",
+                             "reason": f"V9 satellite {self.lookback}d momo {momo:+.1%}, own uptrend"}
+
+        # --- emit -----------------------------------------------------------
+        if gate:
+            for m, meta in target.items():
+                signals.append(Signal(
+                    market=m, side="buy",
+                    confidence=0.9 if meta["role"] == "core" else 0.7,
+                    reason=meta["reason"],
+                    params={"strategy": "gated_coresat", "weight": meta["weight"],
+                            "role": meta["role"]},
+                ))
+            for m in stats:
+                if m not in target:
+                    signals.append(Signal(
+                        market=m, side="sell", confidence=0.5,
+                        reason="V9 rotation out (not core, not a qualifying satellite)",
+                        params={"strategy": "gated_coresat", "weight": 0.0},
+                    ))
+        else:
+            held = set(stats) | {self.core_market}
+            for m in held:
+                signals.append(Signal(
+                    market=m, side="sell", confidence=1.0,
+                    reason="V9 risk-OFF: BTC below EMA gate → cash",
+                    params={"strategy": "gated_coresat", "weight": 0.0},
+                ))
+        return signals
+
+
 def get_strategy(config: Dict) -> BaseStrategy:
     name = config.get("name", "ma_crossover")
+    if name == "gated_coresat":
+        return GatedCoreSatelliteStrategy(config)
     if name == "ma_crossover":
         return MACrossoverStrategy(config)
     elif name == "enhanced_ma_crossover":

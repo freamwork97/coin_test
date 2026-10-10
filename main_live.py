@@ -1007,6 +1007,16 @@ class LiveBot:
                         # Strategy-specific sizing + exit rules
                         custom_exit = None
                         size_pct = effective_size
+                        if sig_strategy == "gated_coresat":
+                            # V9: the strategy itself decides the weight of each leg
+                            # (BTC core 70%, satellite 20%) so sizing is not
+                            # equal-weight. Hard stop per position still applies.
+                            size_pct = float(sig.params.get("weight", effective_size))
+                            custom_exit = {
+                                "stop_loss_pct": self.safety.forced_sell.get("stop_loss_pct", -15.0),
+                                "take_profit_pct": self.safety.forced_sell.get("take_profit_pct", 100.0),
+                                "max_hold_hours": self.safety.forced_sell.get("max_hold_hours", 8760),
+                            }
                         if sig_strategy == "mean_reversion" and self.mr_strategy:
                             mr_open = sum(1 for s in self.safety.position_strategy.values()
                                           if s == "mean_reversion")
@@ -1052,7 +1062,7 @@ class LiveBot:
                         pos_strategy = self.safety.position_strategy.get(sig.market, "unknown")
                         if not (pos_strategy == sig_strategy or
                                 (pos_strategy == "unknown" and sig_strategy == "trendrider") or
-                                sig_strategy == "gatemomentum"):
+                                sig_strategy in ("gatemomentum", "gated_coresat")):
                             logger.debug("SELL %s from %s skipped — position owned by %s",
                                          sig.market, sig_strategy, pos_strategy)
                             continue

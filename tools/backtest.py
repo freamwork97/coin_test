@@ -121,10 +121,17 @@ def emit(tl, maps, data, per):
 # ---------------------------------------------------------------------------
 def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
              stop_loss=None, trail_act=None, trail_dist=None, start=None, end=None,
-             port_stop=None, port_cooldown=0):
+             port_stop=None, port_cooldown=0, gross_cap=None,
+             port_reset_peak=True, weights=None, default_weight=0.20):
     """port_stop: if equity falls this fraction below its running peak, liquidate
     and stay in cash for `port_cooldown` bars (a portfolio drawdown circuit
-    breaker). None disables it."""
+    breaker). None disables it.
+    gross_cap: max fraction of portfolio value deployable into positions
+    (e.g. 0.6 → never more than 60% invested). None = no cap.
+    port_reset_peak: re-anchor the peak to the equity level when a cooldown
+    expires. Without this the old peak is never re-attained, so the first
+    breach halts trading permanently (and the backtest looks 'safe' only
+    because it stops trading at all)."""
     n = len(tl)
     lo = start if start is not None else 0
     hi = end if end is not None else n
@@ -135,6 +142,7 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
     exposure = 0
     pk = initial
     halt_until = -1
+    was_halted = False
 
     for i in range(lo, hi):
         px = lambda m: closes[m][i]
@@ -161,10 +169,14 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
 
         # portfolio drawdown circuit breaker
         pv_now = cash + sum(pos[m]["qty"] * px(m) for m in pos if px(m))
+        if port_stop is not None and port_reset_peak and was_halted and i >= halt_until:
+            pk = pv_now            # re-anchor after cooldown expires
+            was_halted = False
         pk = max(pk, pv_now)
         if port_stop is not None and pk > 0:
             if (pv_now - pk) / pk <= -port_stop and i >= halt_until:
                 halt_until = i + port_cooldown
+                was_halted = True
             if i < halt_until:
                 # forced liquidation, stay in cash
                 for m in list(pos.keys()):
@@ -195,9 +207,17 @@ def simulate(tl, closes, pref, signals, initial=1_000_000.0, max_positions=5,
         new = [m for m in want if m not in pos][: max(0, max_positions - len(pos))]
         if new:
             pv = cash + sum(pos[m]["qty"] * px(m) for m in pos if px(m))
-            alloc = min(cash * 0.99 / len(new), pv / max_positions)
-            for m in new:
+            held_val = sum(pos[m]["qty"] * px(m) for m in pos if px(m))
+            for k, m in enumerate(new):
                 c = px(m)
+                if weights:
+                    alloc = min(cash, pv * weights.get(m, default_weight))
+                else:
+                    alloc = min(cash * 0.99 / len(new), pv / max_positions)
+                    if gross_cap is not None:
+                        room = pv * gross_cap - held_val - sum(
+                            pos[q]["qty"] * px(q) for q in new[:k] if q in pos and px(q))
+                        alloc = min(alloc, max(0.0, room))
                 if alloc < 5000:
                     break
                 fill = c * (1 + SLIP)
